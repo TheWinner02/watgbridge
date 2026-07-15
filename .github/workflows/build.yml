@@ -7,76 +7,138 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      distro:
+        description: 'Choose distribution'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - ubuntu-20.04
+          - ubuntu-22.04
+          - ubuntu-24.04
+          - debian-11
+          - debian-12
+      arch:
+        description: 'Choose architecture'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - amd64
+          - arm64
 
 jobs:
 
-  build-amd64:
+  setup:
+    name: Setup Build Matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+    - name: Generate Matrix JSON
+      id: set-matrix
+      run: |
+        SELECTED_DISTRO="${{ github.event.inputs.distro || 'all' }}"
+        SELECTED_ARCH="${{ github.event.inputs.arch || 'all' }}"
+
+        DISTROS=("ubuntu-20.04" "ubuntu-22.04" "ubuntu-24.04" "debian-11" "debian-12")
+        ARCHS=("amd64" "arm64")
+
+        if [ "$SELECTED_DISTRO" != "all" ]; then
+          DISTROS=("$SELECTED_DISTRO")
+        fi
+        if [ "$SELECTED_ARCH" != "all" ]; then
+          ARCHS=("$SELECTED_ARCH")
+        fi
+
+        JSON_INCLUDE="[]"
+        for distro in "${DISTROS[@]}"; do
+          case "$distro" in
+            ubuntu-20.04) image="ubuntu:20.04" ;;
+            ubuntu-22.04) image="ubuntu:22.04" ;;
+            ubuntu-24.04) image="ubuntu:24.04" ;;
+            debian-11)    image="debian:11" ;;
+            debian-12)    image="debian:12" ;;
+            *) image="ubuntu:22.04" ;;
+          esac
+
+          for arch in "${ARCHS[@]}"; do
+            JSON_INCLUDE=$(echo "$JSON_INCLUDE" | jq ". + [{\"os\": \"$distro\", \"image\": \"$image\", \"arch\": \"$arch\"}]")
+          done
+        done
+
+        MATRIX_JSON=$(jq -n --argjson include "$JSON_INCLUDE" '{include: $include}')
+        echo "matrix=$MATRIX_JSON" >> $GITHUB_OUTPUT
+
+  build:
+    name: Build ${{ matrix.os }} (${{ matrix.arch }})
+    needs: setup
     runs-on: ubuntu-latest
     strategy:
-      matrix:
-        architecture: [amd64]
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
 
     steps:
-    - uses: actions/checkout@v3
+    - name: Checkout repository
+      uses: actions/checkout@v4
 
-    - name: Install dependencies
+    - name: Build binary inside Docker container
       run: |
-        sudo apt-get update
-        sudo apt-get install -y gcc golang
-    - name: Set up Go
-      uses: actions/setup-go@v4
-      with:
-        go-version: '1.25'
+        if [ "${{ matrix.arch }}" = "amd64" ]; then
+          docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace ${{ matrix.image }} bash -c "
+            apt-get update &&
+            DEBIAN_FRONTEND=noninteractive apt-get install -y gcc g++ git wget tar ca-certificates &&
+            wget -q https://go.dev/dl/go1.25.0.linux-amd64.tar.gz &&
+            tar -C /usr/local -xzf go1.25.0.linux-amd64.tar.gz &&
+            export PATH=\$PATH:/usr/local/go/bin &&
+            CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -o watgbridge_${{ matrix.os }}_amd64 . &&
+            chmod 755 watgbridge_${{ matrix.os }}_amd64
+          "
+        else
+          docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace ${{ matrix.image }} bash -c "
+            apt-get update &&
+            DEBIAN_FRONTEND=noninteractive apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu git wget tar ca-certificates &&
+            wget -q https://go.dev/dl/go1.25.0.linux-amd64.tar.gz &&
+            tar -C /usr/local -xzf go1.25.0.linux-amd64.tar.gz &&
+            export PATH=\$PATH:/usr/local/go/bin &&
+            CGO_ENABLED=1 CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++ GOOS=linux GOARCH=arm64 go build -ldflags '-s -w' -o watgbridge_${{ matrix.os }}_arm64 . &&
+            chmod 755 watgbridge_${{ matrix.os }}_arm64
+          "
+        fi
 
-    - name: Build
-      run: GOARCH=amd64 GOOS=linux go build -ldflags '-s -w' -o watgbridge_linux_amd64 .
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: watgbridge_${{ matrix.os }}_${{ matrix.arch }}
+        path: ./watgbridge_${{ matrix.os }}_${{ matrix.arch }}
+
+  release:
+    name: Create Release
+    needs: [setup, build]
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
 
     - name: Get Project Version
       id: get_version
       run: |
         echo "version=$(cat state/version.txt | tr -d '\n')" >> $GITHUB_OUTPUT
 
-    - name: Create Release for amd64
-      if: always()
+    - name: Download all artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: ./artifacts
+        pattern: watgbridge_*
+        merge-multiple: true
+
+    - name: Create Release
       uses: softprops/action-gh-release@v1
       with:
-        files: ./watgbridge_linux_amd64
-        tag_name: v${{ steps.get_version.outputs.version }}
-        name: Release ${{ steps.get_version.outputs.version }}
-      env:
-        GITHUB_TOKEN: ${{ github.token }}
-
-  build-arm64:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        architecture: [arm64]
-
-    steps:
-    - uses: actions/checkout@v3
-
-    - name: Install dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y golang gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
-    - name: Set up Go
-      uses: actions/setup-go@v4
-      with:
-        go-version: '1.25'
-
-    - name: Build
-      run: CGO_ENABLED=1 CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++ GOARCH=arm64 GOOS=linux go build -ldflags '-s -w' -o watgbridge_linux_aarch64 .
-
-    - name: Get Project Version
-      id: get_version
-      run: |
-        echo "version=$(cat state/version.txt | tr -d '\n')" >> $GITHUB_OUTPUT
-
-    - name: Create Release for arm64
-      if: always()
-      uses: softprops/action-gh-release@v1
-      with:
-        files: ./watgbridge_linux_aarch64
+        files: ./artifacts/watgbridge_*
         tag_name: v${{ steps.get_version.outputs.version }}
         name: Release ${{ steps.get_version.outputs.version }}
       env:

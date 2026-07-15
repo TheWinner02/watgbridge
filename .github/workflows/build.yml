@@ -6,6 +6,7 @@ on:
       - state/version.txt
     branches:
       - main
+      - dev
   workflow_dispatch:
     inputs:
       distro:

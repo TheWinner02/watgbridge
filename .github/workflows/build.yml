@@ -88,27 +88,32 @@ jobs:
 
     - name: Build binary inside Docker container
       run: |
-        if [ "${{ matrix.arch }}" = "amd64" ]; then
-          docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace ${{ matrix.image }} bash -c "
-            apt-get update &&
-            DEBIAN_FRONTEND=noninteractive apt-get install -y gcc g++ git wget tar ca-certificates &&
-            wget -q https://go.dev/dl/go1.25.0.linux-amd64.tar.gz &&
-            tar -C /usr/local -xzf go1.25.0.linux-amd64.tar.gz &&
-            export PATH=\$PATH:/usr/local/go/bin &&
-            CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -o watgbridge_${{ matrix.os }}_amd64 . &&
-            chmod 755 watgbridge_${{ matrix.os }}_amd64
-          "
-        else
-          docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace ${{ matrix.image }} bash -c "
-            apt-get update &&
-            DEBIAN_FRONTEND=noninteractive apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu git wget tar ca-certificates &&
-            wget -q https://go.dev/dl/go1.25.0.linux-amd64.tar.gz &&
-            tar -C /usr/local -xzf go1.25.0.linux-amd64.tar.gz &&
-            export PATH=\$PATH:/usr/local/go/bin &&
-            CGO_ENABLED=1 CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++ GOOS=linux GOARCH=arm64 go build -ldflags '-s -w' -o watgbridge_${{ matrix.os }}_arm64 . &&
-            chmod 755 watgbridge_${{ matrix.os }}_arm64
-          "
+        cat << 'EOF' > build_internal.sh
+        #!/bin/bash
+        set -e
+        apt-get update
+        DEBIAN_FRONTEND=noninteractive apt-get install -y gcc g++ git wget tar ca-certificates
+
+        if [ "$BUILD_ARCH" = "arm64" ]; then
+          DEBIAN_FRONTEND=noninteractive apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
         fi
+
+        wget -q https://go.dev/dl/go1.25.0.linux-amd64.tar.gz
+        tar -C /usr/local -xzf go1.25.0.linux-amd64.tar.gz
+        export PATH=$PATH:/usr/local/go/bin
+
+        if [ "$BUILD_ARCH" = "amd64" ]; then
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -o watgbridge_${BUILD_OS}_amd64 .
+          chmod 755 watgbridge_${BUILD_OS}_amd64
+        else
+          CGO_ENABLED=1 CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++ GOOS=linux GOARCH=arm64 go build -ldflags '-s -w' -o watgbridge_${BUILD_OS}_arm64 .
+          chmod 755 watgbridge_${BUILD_OS}_arm64
+        fi
+        EOF
+
+        chmod +x build_internal.sh
+        docker run --rm -v ${{ github.workspace }}:/workspace -w /workspace -e BUILD_OS="${{ matrix.os }}" -e BUILD_ARCH="${{ matrix.arch }}" ${{ matrix.image }} ./build_internal.sh
+        rm build_internal.sh
 
     - name: Upload Artifact
       uses: actions/upload-artifact@v4

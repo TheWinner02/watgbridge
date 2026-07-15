@@ -67,11 +67,11 @@ jobs:
           esac
 
           for arch in "${ARCHS[@]}"; do
-            JSON_INCLUDE=$(echo "$JSON_INCLUDE" | jq ". + [{\"os\": \"$distro\", \"image\": \"$image\", \"arch\": \"$arch\"}]")
+            JSON_INCLUDE=$(echo "$JSON_INCLUDE" | jq -c ". + [{\"os\": \"$distro\", \"image\": \"$image\", \"arch\": \"$arch\"}]")
           done
         done
 
-        MATRIX_JSON=$(jq -n --argjson include "$JSON_INCLUDE" '{include: $include}')
+        MATRIX_JSON=$(jq -c -n --argjson include "$JSON_INCLUDE" '{include: $include}')
         echo "matrix=$MATRIX_JSON" >> $GITHUB_OUTPUT
 
   build:

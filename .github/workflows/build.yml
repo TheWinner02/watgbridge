@@ -94,6 +94,8 @@ jobs:
         apt-get update
         DEBIAN_FRONTEND=noninteractive apt-get install -y gcc g++ git wget tar ca-certificates
 
+        git config --global --add safe.directory /workspace
+
         if [ "$BUILD_ARCH" = "arm64" ]; then
           DEBIAN_FRONTEND=noninteractive apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
         fi
@@ -103,10 +105,10 @@ jobs:
         export PATH=$PATH:/usr/local/go/bin
 
         if [ "$BUILD_ARCH" = "amd64" ]; then
-          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -ldflags '-s -w' -o watgbridge_${BUILD_OS}_amd64 .
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -buildvcs=false -ldflags '-s -w' -o watgbridge_${BUILD_OS}_amd64 .
           chmod 755 watgbridge_${BUILD_OS}_amd64
         else
-          CGO_ENABLED=1 CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++ GOOS=linux GOARCH=arm64 go build -ldflags '-s -w' -o watgbridge_${BUILD_OS}_arm64 .
+          CGO_ENABLED=1 CC=aarch64-linux-gnu-gcc CXX=aarch64-linux-gnu-g++ GOOS=linux GOARCH=arm64 go build -buildvcs=false -ldflags '-s -w' -o watgbridge_${BUILD_OS}_arm64 .
           chmod 755 watgbridge_${BUILD_OS}_arm64
         fi
         EOF

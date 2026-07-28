@@ -191,6 +191,16 @@ func MessageFromOthersEventHandler(text string, v *events.Message, isEdited bool
 		}
 	}
 
+	if !isEdited && cfg.Gemini.Enabled && cfg.Gemini.AutoReplyPrivate && !v.Info.IsGroup && !v.Info.IsFromMe && text != "" {
+		go func() {
+			prompt := fmt.Sprintf("System Instructions: %s\n\nIncoming WhatsApp Message: \"%s\"", cfg.Gemini.SystemPrompt, text)
+			response, err := utils.CallGemini(cfg.Gemini.APIKey, prompt)
+			if err == nil && response != "" {
+				_, _ = utils.WaSendText(v.Info.Chat, response, msgId, v.Info.MessageSource.Sender.String(), nil, true)
+			}
+		}()
+	}
+
 	if v.Info.Chat.String() == "status@broadcast" &&
 		(cfg.WhatsApp.SkipStatus ||
 			slices.Contains(cfg.WhatsApp.StatusIgnoredChats, v.Info.MessageSource.Sender.User)) {

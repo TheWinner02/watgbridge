@@ -184,6 +184,10 @@ func NewWhatsAppClient() error {
 		}
 	}
 
+	if client.Store.ID == nil {
+		return fmt.Errorf("failed to login to WhatsApp: connection closed without pairing")
+	}
+
 	logger.Info("successfully logged into WhatsApp",
 		zap.String("push_name", client.Store.PushName),
 		zap.String("jid", client.Store.ID.String()),

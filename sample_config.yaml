@@ -77,6 +77,12 @@ whatsapp:
     pack_name: WaTgBridge
     author_name: WaTgBridge
 
+gemini:
+  enabled: false
+  api_key: "YOUR_GEMINI_API_KEY_HERE"
+  system_prompt: "You are a helpful AI assistant connected to a WhatsApp bridge. Reply to the message concisely."
+  auto_reply_private: false       # If true, automatically answers incoming private WhatsApp messages using Gemini
+
 
 #Uncomment any on of these sections
 #Using the sqlite database will be easiest as it does not require any hosted database server and stores data in a single file on your device

@@ -73,6 +73,13 @@ type Config struct {
 		CreateThreadForInfoUpdates     bool     `yaml:"create_thread_for_info_updates"`
 	} `yaml:"whatsapp"`
 
+	Gemini struct {
+		APIKey           string `yaml:"api_key"`
+		Enabled          bool   `yaml:"enabled"`
+		SystemPrompt     string `yaml:"system_prompt"`
+		AutoReplyPrivate bool   `yaml:"auto_reply_private"`
+	} `yaml:"gemini"`
+
 	Database map[string]string `yaml:"database"`
 }
 
@@ -153,4 +160,6 @@ func (cfg *Config) SetDefaults() {
 	cfg.WhatsApp.StickerMetadata.AuthorName = "WaTgBridge"
 
 	cfg.Telegram.ConfirmationType = "emoji"
+
+	cfg.Gemini.SystemPrompt = "You are a helpful AI assistant connected to a WhatsApp bridge. Reply to the message concisely."
 }

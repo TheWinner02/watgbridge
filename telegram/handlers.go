@@ -1565,19 +1565,25 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 				}
 
 				text = fmt.Sprintf("<b>Chat & Thread Management</b>\n\nStatus: 🔗 <b>Linked</b>\nWhatsApp Chat: <code>%s</code>\nName: <b>%s</b>\n\n<i>Configure or remove the mapping for the current thread.</i>", html.EscapeString(waChatID), html.EscapeString(chatName))
-				keyboard = &gotgbot.InlineKeyboardMarkup{
-					InlineKeyboard: [][]gotgbot.InlineKeyboardButton{
-						{
-							{Text: "🔗 Unlink Current Thread", CallbackData: "menu_unlink_current"},
-						},
-						{
-							{Text: "📁 Sync Topic Names (All)", CallbackData: "menu_sync_topics"},
-						},
-						{
-							{Text: "🔙 Back", CallbackData: "menu_main"},
-						},
-					},
+
+				var rows [][]gotgbot.InlineKeyboardButton
+				if waChatJID.Server == waTypes.GroupServer {
+					rows = append(rows, []gotgbot.InlineKeyboardButton{
+						{Text: "👥 Group Members", CallbackData: "menu_group_members"},
+					})
 				}
+				rows = append(rows,
+					[]gotgbot.InlineKeyboardButton{
+						{Text: "🔗 Unlink Current Thread", CallbackData: "menu_unlink_current"},
+					},
+					[]gotgbot.InlineKeyboardButton{
+						{Text: "📁 Sync Topic Names (All)", CallbackData: "menu_sync_topics"},
+					},
+					[]gotgbot.InlineKeyboardButton{
+						{Text: "🔙 Back", CallbackData: "menu_main"},
+					},
+				)
+				keyboard = &gotgbot.InlineKeyboardMarkup{InlineKeyboard: rows}
 			} else {
 				if c.EffectiveMessage.MessageThreadId == 0 {
 					text = "<b>Chat & Thread Management</b>\n\nStatus: ❌ <b>Unlinked</b>\n\n<i>This is the main chat. Mapping a WhatsApp chat is only supported inside individual forum topics (threads). Open a topic and run /menu there to configure it.</i>"
@@ -1615,6 +1621,61 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 			cq.Answer(b, nil)
 			return err
 
+		case "menu_group_members":
+			waChatID, err := database.ChatThreadGetWaFromTg(c.EffectiveChat.Id, c.EffectiveMessage.MessageThreadId)
+			if err != nil || waChatID == "" {
+				cq.Answer(b, &gotgbot.AnswerCallbackQueryOpts{Text: "Thread not linked or error", ShowAlert: true})
+				return err
+			}
+			groupJID, ok := utils.WaParseJID(waChatID)
+			if !ok || groupJID.Server != waTypes.GroupServer {
+				cq.Answer(b, &gotgbot.AnswerCallbackQueryOpts{Text: "This thread is not a WhatsApp group", ShowAlert: true})
+				return nil
+			}
+
+			cq.Answer(b, &gotgbot.AnswerCallbackQueryOpts{Text: "Fetching group members..."})
+
+			groupInfo, err := state.State.WhatsAppClient.GetGroupInfo(context.Background(), groupJID)
+			if err != nil {
+				cq.Answer(b, &gotgbot.AnswerCallbackQueryOpts{Text: "Failed to get group info: " + err.Error(), ShowAlert: true})
+				return err
+			}
+
+			outputString := fmt.Sprintf("👥 <b>Group members for %s (%d):</b>\n\n", html.EscapeString(groupInfo.Name), len(groupInfo.Participants))
+			for i, participant := range groupInfo.Participants {
+				participantJID := participant.JID.ToNonAD()
+				memberName := utils.WaGetContactName(participantJID)
+				if memberName == "" {
+					memberName = participantJID.User
+				}
+
+				outputString += fmt.Sprintf("%d. <i>%s</i> [ <code>%s</code> ]\n",
+					i+1,
+					html.EscapeString(memberName),
+					html.EscapeString(participantJID.String()),
+				)
+
+				if len(outputString) >= 1500 {
+					outputString += "\n<i>...list truncated, too many members...</i>"
+					break
+				}
+			}
+
+			backKeyboard := &gotgbot.InlineKeyboardMarkup{
+				InlineKeyboard: [][]gotgbot.InlineKeyboardButton{{{
+					Text:         "🔙 Back",
+					CallbackData: "menu_chats",
+				}}},
+			}
+
+			_, _, err = b.EditMessageText(outputString, &gotgbot.EditMessageTextOpts{
+				ChatId:      c.EffectiveChat.Id,
+				MessageId:   c.EffectiveMessage.MessageId,
+				ReplyMarkup: *backKeyboard,
+				ParseMode:   "HTML",
+			})
+			return err
+
 		case "menu_unlink_current":
 			err := database.ChatThreadDropPairByTg(c.EffectiveChat.Id, c.EffectiveMessage.MessageThreadId)
 			if err != nil {
@@ -1635,6 +1696,10 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 					{
 						{Text: "🚫 Block User", CallbackData: "menu_exp_block"},
 						{Text: "🟢 Unblock User", CallbackData: "menu_exp_unblock"},
+					},
+					{
+						{Text: "📝 WhatsApp Status", CallbackData: "menu_exp_setstatus"},
+						{Text: "💾 Backup DB Now", CallbackData: "menu_trigger_backup"},
 					},
 					{
 						{Text: "🗑️ Clear Pair History", CallbackData: "menu_clearpair_confirm"},
@@ -1821,6 +1886,52 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 				ParseMode: "HTML",
 			})
 			return UpdateAndRestartHandler(b, c)
+
+		case "menu_trigger_backup":
+			cq.Answer(b, &gotgbot.AnswerCallbackQueryOpts{Text: "Generating backup..."})
+			b.EditMessageText("💾 <b>Generating database backup archive...</b>", &gotgbot.EditMessageTextOpts{
+				ChatId:    c.EffectiveChat.Id,
+				MessageId: c.EffectiveMessage.MessageId,
+				ParseMode: "HTML",
+			})
+			err := utils.RunDatabaseBackupOnce()
+			var statusText string
+			if err != nil {
+				statusText = "❌ <b>Failed to create backup:</b>\n" + html.EscapeString(err.Error())
+			} else {
+				statusText = "✅ <b>Database backup successfully generated and sent to Telegram!</b>"
+			}
+
+			backKeyboard := &gotgbot.InlineKeyboardMarkup{
+				InlineKeyboard: [][]gotgbot.InlineKeyboardButton{{{
+					Text:         "🔙 Back",
+					CallbackData: "menu_tools",
+				}}},
+			}
+
+			b.EditMessageText(statusText, &gotgbot.EditMessageTextOpts{
+				ChatId:      c.EffectiveChat.Id,
+				MessageId:   c.EffectiveMessage.MessageId,
+				ReplyMarkup: *backKeyboard,
+				ParseMode:   "HTML",
+			})
+			return err
+
+		case "menu_exp_setstatus":
+			backKeyboard := &gotgbot.InlineKeyboardMarkup{
+				InlineKeyboard: [][]gotgbot.InlineKeyboardButton{{{
+					Text:         "🔙 Back",
+					CallbackData: "menu_tools",
+				}}},
+			}
+			_, _, err := b.EditMessageText("<b>📝 Set WhatsApp Status Message</b>\n\nTo update your WhatsApp profile 'About / Bio' status text, send:\n\n<code>/setstatusmessage &lt;new status text&gt;</code>\n\n<i>Example: /setstatusmessage Available on Telegram</i>", &gotgbot.EditMessageTextOpts{
+				ChatId:      c.EffectiveChat.Id,
+				MessageId:   c.EffectiveMessage.MessageId,
+				ReplyMarkup: *backKeyboard,
+				ParseMode:   "HTML",
+			})
+			cq.Answer(b, nil)
+			return err
 
 		case "menu_exp_settargetgroupchat":
 			backKeyboard := &gotgbot.InlineKeyboardMarkup{

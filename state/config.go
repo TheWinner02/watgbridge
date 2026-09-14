@@ -41,8 +41,11 @@ type Config struct {
 		SpoilerViewOnce     bool    `yaml:"spoiler_as_viewonce"`
 		Reactions           bool    `yaml:"reactions"`
 		TagAllEnabled       bool    `yaml:"tag_all_enabled"`
-		AutoReactWhenAllRead bool   `yaml:"auto_react_when_all_read"`
-		AutoReactRemoveAfter int64  `yaml:"auto_react_remove_after_seconds"`
+		AutoReactWhenAllRead           bool   `yaml:"auto_react_when_all_read"`
+		AutoReactRemoveAfter           int64  `yaml:"auto_react_remove_after_seconds"`
+		NotifyMessageDelivered         bool   `yaml:"notify_message_delivered"`
+		NotifyMessageRead              bool   `yaml:"notify_message_read"`
+		NotifyReceiptAutoDeleteSeconds uint32 `yaml:"notify_receipt_auto_delete_seconds"`
 	} `yaml:"telegram"`
 
 	WhatsApp struct {
@@ -175,6 +178,7 @@ func (cfg *Config) SetDefaults() {
 	cfg.WhatsApp.StatusMessageDurationSeconds = 86400
 
 	cfg.Telegram.ConfirmationType = "emoji"
+	cfg.Telegram.NotifyReceiptAutoDeleteSeconds = 15
 
 	cfg.Gemini.SystemPrompt = "You are a helpful AI assistant connected to a WhatsApp bridge. Reply to the message concisely."
 	cfg.Backup.Mode = "none"

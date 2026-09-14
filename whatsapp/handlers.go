@@ -8,6 +8,7 @@ import (
 	"html"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"watgbridge/database"
@@ -1392,6 +1393,8 @@ func CallOfferEventHandler(v *events.CallOffer) {
 // Receipts (delivered / read)
 // ============================================================
 
+var notifiedReceipts sync.Map // key: waChatID:msgId:receiptType:participantID -> time.Time
+
 func ReceiptEventHandler(v *events.Receipt) {
 	participantID := v.Sender.ToNonAD().String()
 	waChatID := v.Chat.ToNonAD().String()
@@ -1408,6 +1411,58 @@ func ReceiptEventHandler(v *events.Receipt) {
 	if v.Type == waTypes.ReceiptTypeReadSelf {
 		for _, msgId := range v.MessageIDs {
 			database.MsgIdMarkRead(waChatID, msgId)
+		}
+	}
+
+	shouldNotifyDelivered := cfg.Telegram.NotifyMessageDelivered && v.Type == waTypes.ReceiptTypeDelivered
+	shouldNotifyRead := cfg.Telegram.NotifyMessageRead && v.Type == waTypes.ReceiptTypeRead
+
+	if (shouldNotifyDelivered || shouldNotifyRead) && tgBot != nil && waClient != nil {
+		for _, msgId := range v.MessageIDs {
+			dedupKey := fmt.Sprintf("%s:%s:%s:%s", waChatID, msgId, v.Type, participantID)
+			if _, exists := notifiedReceipts.LoadOrStore(dedupKey, time.Now()); exists {
+				continue
+			}
+
+			tgChatId, tgThreadId, tgMsgId, err := database.MsgIdGetTgFromWa(msgId, waChatID)
+			if err != nil || tgChatId == 0 || tgMsgId == 0 {
+				continue
+			}
+
+			var notifText string
+			if v.IsGroup {
+				participantJID, _ := utils.WaParseJID(participantID)
+				name := utils.WaGetContactName(participantJID)
+				if name == "" {
+					name = participantJID.User
+				}
+				if v.Type == waTypes.ReceiptTypeRead {
+					notifText = fmt.Sprintf("👁️ <i>Read by %s</i>", html.EscapeString(name))
+				} else {
+					notifText = fmt.Sprintf("📨 <i>Delivered to %s</i>", html.EscapeString(name))
+				}
+			} else {
+				if v.Type == waTypes.ReceiptTypeRead {
+					notifText = "👁️ <i>Read</i>"
+				} else {
+					notifText = "📨 <i>Delivered</i>"
+				}
+			}
+
+			sentMsg, err := tgBot.SendMessage(tgChatId, notifText, &gotgbot.SendMessageOpts{
+				MessageThreadId:     tgThreadId,
+				ReplyParameters:     &gotgbot.ReplyParameters{MessageId: tgMsgId},
+				ParseMode:           "HTML",
+				DisableNotification: cfg.Telegram.SilentConfirmation,
+			})
+			if err == nil && sentMsg != nil && cfg.Telegram.NotifyReceiptAutoDeleteSeconds > 0 {
+				go func(chatID, messageID int64, delay uint32) {
+					time.Sleep(time.Duration(delay) * time.Second)
+					if state.State.TelegramBot != nil {
+						state.State.TelegramBot.DeleteMessage(chatID, messageID, &gotgbot.DeleteMessageOpts{})
+					}
+				}(tgChatId, sentMsg.MessageId, cfg.Telegram.NotifyReceiptAutoDeleteSeconds)
+			}
 		}
 	}
 

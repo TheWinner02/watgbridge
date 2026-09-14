@@ -28,6 +28,8 @@ type Config struct {
 		OwnerID             int64   `yaml:"owner_id"`
 		TargetChatID        int64   `yaml:"target_chat_id"`
 		SelfHostedAPI       bool    `yaml:"self_hosted_api"`
+		SendImagesAsFile    bool    `yaml:"send_images_as_file"`
+		SendStickersAsFile   bool    `yaml:"send_stickers_as_file"`
 		SkipVideoStickers   bool    `yaml:"skip_video_stickers"`
 		SkipSettingCommands bool    `yaml:"skip_setting_commands"`
 		SendMyPresence      bool    `yaml:"send_my_presence"`
@@ -38,6 +40,9 @@ type Config struct {
 		SkipStartupMessage  bool    `yaml:"skip_startup_message"`
 		SpoilerViewOnce     bool    `yaml:"spoiler_as_viewonce"`
 		Reactions           bool    `yaml:"reactions"`
+		TagAllEnabled       bool    `yaml:"tag_all_enabled"`
+		AutoReactWhenAllRead bool   `yaml:"auto_react_when_all_read"`
+		AutoReactRemoveAfter int64  `yaml:"auto_react_remove_after_seconds"`
 	} `yaml:"telegram"`
 
 	WhatsApp struct {
@@ -68,9 +73,12 @@ type Config struct {
 		SkipGroupSettingsUpdates       bool     `yaml:"skip_group_settings_updates"`
 		SkipChatDetails                bool     `yaml:"skip_chat_details"`
 		SendRevokedMessageUpdates      bool     `yaml:"send_revoked_message_updates"`
+		SendEditedMessageUpdates       bool     `yaml:"send_edited_message_updates"`
 		WhatsmeowDebugMode             bool     `yaml:"whatsmeow_debug_mode"`
 		SendMyMessagesFromOtherDevices bool     `yaml:"send_my_messages_from_other_devices"`
 		CreateThreadForInfoUpdates     bool     `yaml:"create_thread_for_info_updates"`
+		SkipPinnedMessages             bool     `yaml:"skip_pinned_messages"`
+		StatusMessageDurationSeconds   uint32   `yaml:"status_message_duration_seconds"`
 	} `yaml:"whatsapp"`
 
 	Gemini struct {
@@ -81,6 +89,12 @@ type Config struct {
 	} `yaml:"gemini"`
 
 	Database map[string]string `yaml:"database"`
+
+	Backup struct {
+		Mode         string `yaml:"mode"`
+		CronSchedule string `yaml:"cron_schedule"`
+		ThreadName   string `yaml:"thread_name"`
+	} `yaml:"backup"`
 }
 
 func (cfg *Config) LoadConfig() error {
@@ -158,8 +172,12 @@ func (cfg *Config) SetDefaults() {
 	cfg.WhatsApp.LoginDatabase.URL = "file:wawebstore.db?foreign_keys=on"
 	cfg.WhatsApp.StickerMetadata.PackName = "WaTgBridge"
 	cfg.WhatsApp.StickerMetadata.AuthorName = "WaTgBridge"
+	cfg.WhatsApp.StatusMessageDurationSeconds = 86400
 
 	cfg.Telegram.ConfirmationType = "emoji"
 
 	cfg.Gemini.SystemPrompt = "You are a helpful AI assistant connected to a WhatsApp bridge. Reply to the message concisely."
+	cfg.Backup.Mode = "none"
+	cfg.Backup.CronSchedule = "0 0 * * *"
+	cfg.Backup.ThreadName = "Database Backups"
 }

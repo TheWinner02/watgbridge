@@ -2,15 +2,38 @@ package database
 
 import (
 	"database/sql"
+	"strings"
+	"time"
 
 	"watgbridge/state"
 
 	"go.mau.fi/whatsmeow/types"
 )
 
+func isSelfJID(participantId string) bool {
+	if state.State.WhatsAppClient == nil || state.State.WhatsAppClient.Store == nil {
+		return false
+	}
+	selfUser := state.State.WhatsAppClient.Store.ID.User
+	if selfUser == "" {
+		return false
+	}
+	parsed, err := types.ParseJID(participantId)
+	if err == nil && parsed.User != "" {
+		return parsed.User == selfUser
+	}
+	user := participantId
+	if idx := strings.IndexAny(user, ":@"); idx != -1 {
+		user = user[:idx]
+	}
+	return user == selfUser
+}
+
 func MsgIdAddNewPair(waMsgId, participantId, waChatId string, tgChatId, tgMsgId, tgThreadId int64) error {
 
 	db := state.State.Database
+
+	isOutgoing := isSelfJID(participantId)
 
 	var bridgePair MsgIdPair
 	res := db.Where("id = ? AND wa_chat_id = ?", waMsgId, waChatId).Find(&bridgePair)
@@ -24,7 +47,7 @@ func MsgIdAddNewPair(waMsgId, participantId, waChatId string, tgChatId, tgMsgId,
 		bridgePair.TgChatId = tgChatId
 		bridgePair.TgMsgId = tgMsgId
 		bridgePair.TgThreadId = tgThreadId
-		bridgePair.MarkRead = sql.NullBool{Valid: true, Bool: false}
+		bridgePair.MarkRead = sql.NullBool{Valid: true, Bool: isOutgoing}
 		res = db.Save(&bridgePair)
 		return res.Error
 	}
@@ -36,7 +59,7 @@ func MsgIdAddNewPair(waMsgId, participantId, waChatId string, tgChatId, tgMsgId,
 		TgChatId:      tgChatId,
 		TgMsgId:       tgMsgId,
 		TgThreadId:    tgThreadId,
-		MarkRead:      sql.NullBool{Valid: true, Bool: false},
+		MarkRead:      sql.NullBool{Valid: true, Bool: isOutgoing},
 	})
 	return res.Error
 }
@@ -87,6 +110,9 @@ func MsgIdGetUnread(waChatId string) (map[string]([]string), error) {
 	var msgIds = make(map[string]([]string))
 
 	for _, pair := range bridgePairs {
+		if isSelfJID(pair.ParticipantId) {
+			continue
+		}
 		if _, found := msgIds[pair.ParticipantId]; !found {
 			msgIds[pair.ParticipantId] = []string{}
 		}
@@ -115,6 +141,26 @@ func MsgIdMarkRead(waChatId, waMsgId string) error {
 	return nil
 }
 
+func MsgIdHasAutoReacted(waChatId, waMsgId string) (bool, error) {
+	db := state.State.Database
+
+	var bridgePair MsgIdPair
+	res := db.Where("id = ? AND wa_chat_id = ?", waMsgId, waChatId).Find(&bridgePair)
+	if res.Error != nil {
+		return false, res.Error
+	}
+
+	return bridgePair.AutoReacted, nil
+}
+
+func MsgIdMarkAutoReacted(waChatId, waMsgId string) error {
+	db := state.State.Database
+
+	return db.Model(&MsgIdPair{}).
+		Where("id = ? AND wa_chat_id = ?", waMsgId, waChatId).
+		Update("auto_reacted", true).Error
+}
+
 func MsgIdDeletePair(tgChatId, tgMsgId int64) error {
 
 	db := state.State.Database
@@ -129,6 +175,40 @@ func MsgIdDropAllPairs() error {
 	res := db.Where("1 = 1").Delete(&MsgIdPair{})
 
 	return res.Error
+}
+
+func MsgReceiptUpsert(waMsgId, waChatId, participantId string, receiptType types.ReceiptType, receiptTime time.Time) error {
+	db := state.State.Database
+
+	var receipt MessageReceipt
+	res := db.Where("wa_msg_id = ? AND wa_chat_id = ? AND participant_id = ?", waMsgId, waChatId, participantId).Find(&receipt)
+	if res.Error != nil {
+		return res.Error
+	}
+
+	if receipt.WaMsgId == waMsgId && receipt.WaChatId == waChatId && receipt.ParticipantId == participantId {
+		receipt.ReceiptType = string(receiptType)
+		receipt.ReceiptTime = receiptTime
+		res = db.Save(&receipt)
+		return res.Error
+	}
+
+	res = db.Create(&MessageReceipt{
+		WaMsgId:       waMsgId,
+		WaChatId:      waChatId,
+		ParticipantId: participantId,
+		ReceiptType:   string(receiptType),
+		ReceiptTime:   receiptTime,
+	})
+	return res.Error
+}
+
+func MsgReceiptGetByMsg(waMsgId, waChatId string) ([]MessageReceipt, error) {
+	db := state.State.Database
+
+	var receipts []MessageReceipt
+	res := db.Where("wa_msg_id = ? AND wa_chat_id = ?", waMsgId, waChatId).Order("receipt_time DESC").Find(&receipts)
+	return receipts, res.Error
 }
 
 func ChatThreadAddNewPair(waChatId string, tgChatId, tgThreadId int64) error {

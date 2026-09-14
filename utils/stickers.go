@@ -6,10 +6,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"image"
+
 	// "image/color"
 	"image/draw"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 
 	"watgbridge/state"
 
@@ -50,37 +53,82 @@ func TGSConvertToWebp(tgsStickerData []byte, updateId int64) ([]byte, error) {
 	return nil, fmt.Errorf("sticker has a lot of data which cannot be handled by WhatsApp")
 }
 
-func WebmConvertToWebp(webmStickerData []byte, scale, pad string, updateId int64) ([]byte, error) {
+func WebmConvertToWebp(webmStickerData []byte, updateId int64) ([]byte, error) {
 	logger := state.State.Logger
 	defer logger.Sync()
 
-	cmd := exec.Command(state.State.Config.FfmpegExecutable,
-		"-i", "-",
-		"-fs", "800000",
-		"-compression_level", "6",
-		"-vf", fmt.Sprintf("fps=15,format=rgba,scale=%s,pad=%s:color=#00000000", scale, pad),
-		"-f", "webp",
-		"-",
+	ffmpegExec := state.State.Config.FfmpegExecutable
+	if ffmpegExec == "" {
+		ffmpegExec = "ffmpeg"
+	}
+
+	tempInput, err := os.CreateTemp("", "webm_input_*.webm")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp input file for webm: %w", err)
+	}
+	defer os.Remove(tempInput.Name())
+
+	if _, err := tempInput.Write(webmStickerData); err != nil {
+		tempInput.Close()
+		return nil, fmt.Errorf("failed to write temp input file for webm: %w", err)
+	}
+	tempInput.Close()
+
+	tempOutput, err := os.CreateTemp("", "webp_output_*.webp")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp output file for webp: %w", err)
+	}
+	defer os.Remove(tempOutput.Name())
+	tempOutput.Close()
+
+	var (
+		quality = 75
+		fps     = 15
 	)
 
-	var outputBuf, stderr bytes.Buffer
-	cmd.Stdin = bytes.NewReader(webmStickerData)
-	cmd.Stdout = &outputBuf
-	cmd.Stderr = &stderr
-
-	if err := cmd.Run(); err != nil {
-		logger.Debug("ffmpeg command failed",
-			zap.Error(err),
-			zap.String("stderr", stderr.String()),
+	for quality >= 30 && fps >= 8 {
+		vf := fmt.Sprintf("fps=%d,scale=512:512:force_original_aspect_ratio=decrease:force_divisible_by=2,pad=512:512:(ow-iw)/2:(oh-ih)/2:color=#00000000,format=rgba", fps)
+		cmd := exec.Command(ffmpegExec,
+			"-i", tempInput.Name(),
+			"-c:v", "libwebp",
+			"-loop", "0",
+			"-preset", "default",
+			"-an",
+			"-vsync", "0",
+			"-quality", strconv.Itoa(quality),
+			"-compression_level", "6",
+			"-vf", vf,
+			"-f", "webp",
+			"-y",
+			tempOutput.Name(),
 		)
-		return nil, err
+
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+
+		if err := cmd.Run(); err == nil {
+			outputBytes, readErr := os.ReadFile(tempOutput.Name())
+			if readErr == nil && len(outputBytes) > 0 && len(outputBytes) <= 500*1024 {
+				if outputDataWithExif, err := WebpWriteExifData(outputBytes); err == nil {
+					return outputDataWithExif, nil
+				} else {
+					logger.Debug("failed to write exif to webp", zap.Error(err))
+				}
+				return outputBytes, nil
+			}
+		} else {
+			logger.Debug("ffmpeg webm conversion attempt failed",
+				zap.Int("quality", quality),
+				zap.Int("fps", fps),
+				zap.String("stderr", stderr.String()),
+			)
+		}
+
+		quality -= 15
+		fps -= 2
 	}
 
-	if outputDataWithExif, err := WebpWriteExifData(outputBuf.Bytes()); err == nil {
-		return outputDataWithExif, nil
-	}
-
-	return outputBuf.Bytes(), nil
+	return nil, fmt.Errorf("webm sticker could not be converted under WhatsApp size limit")
 }
 
 func WebpImagePad(inputData []byte, wPad, hPad int, updateId int64) ([]byte, error) {
@@ -112,6 +160,100 @@ func WebpImagePad(inputData []byte, wPad, hPad int, updateId int64) ([]byte, err
 	return outputBytes, nil
 }
 
+func AnimatedWebpConvertToWebm(inputData []byte, updateId string) ([]byte, error) {
+	var (
+		logger = state.State.Logger
+
+		currPath   = filepath.Join("downloads", updateId)
+		inputPath  = filepath.Join(currPath, "input.webp")
+		outputPath = filepath.Join(currPath, "output.webm")
+	)
+	defer logger.Sync()
+
+	if err := os.MkdirAll(currPath, os.ModePerm); err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(currPath)
+
+	if err := os.WriteFile(inputPath, inputData, os.ModePerm); err != nil {
+		return nil, err
+	}
+
+	// Convert WebP to WEBM with VP9 codec
+	// Following Telegram's requirements:
+	// - One side must be exactly 512px (other can be 512px or less)
+	// - Max 30 FPS
+	// - Loop for optimal UX
+	// - Max 256KB file size
+	// - VP9 codec
+	// - No audio stream
+	logger.Debug("Starting WEBM conversion",
+		zap.String("inputPath", inputPath),
+		zap.String("outputPath", outputPath),
+	)
+
+	// First convert WebP to GIF using ImageMagick (which handles animated WebP better)
+	tempGifPath := filepath.Join(currPath, "temp.gif")
+
+	convertCmd := exec.Command("convert",
+		inputPath,
+		"-coalesce",  // Ensure all frames are complete
+		"-loop", "0", // Loop infinitely
+		tempGifPath,
+	)
+
+	var convertStderr bytes.Buffer
+	convertCmd.Stderr = &convertStderr
+
+	if err := convertCmd.Run(); err != nil {
+		logger.Debug("failed to convert webp to gif with ImageMagick",
+			zap.Error(err),
+			zap.String("stderr", convertStderr.String()),
+		)
+		return nil, err
+	}
+
+	logger.Debug("WebP to GIF conversion completed, now converting to WEBM")
+
+	ffmpegExec := state.State.Config.FfmpegExecutable
+	if ffmpegExec == "" {
+		ffmpegExec = "ffmpeg"
+	}
+
+	// Now convert GIF to WEBM with VP9 codec
+	cmd := exec.Command(ffmpegExec,
+		"-i", tempGifPath,
+		"-c:v", "libvpx-vp9", // VP9 codec
+		"-an",                                                                                       // No audio stream
+		"-vf", "scale=512:512:force_original_aspect_ratio=decrease,pad=512:512:(ow-iw)/2:(oh-ih)/2", // Scale to 512px maintaining aspect ratio
+		"-r", "30", // Max 30 FPS
+		"-b:v", "0", // Use CRF mode
+		"-crf", "30", // Quality setting (lower = better quality, higher file size)
+		"-deadline", "good", // Encoding speed vs quality trade-off
+		"-cpu-used", "2", // CPU usage (0-5, higher = faster encoding)
+		"-fs", "256K", // Max file size 256KB
+		"-y", // Overwrite output file
+		outputPath,
+	)
+
+	// Capture stderr for debugging
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		logger.Debug("failed to run ffmpeg command for webm conversion",
+			zap.Error(err),
+			zap.String("stderr", stderr.String()),
+		)
+		return nil, err
+	}
+
+	logger.Debug("WEBM conversion completed successfully")
+
+	return os.ReadFile(outputPath)
+}
+
+// Fallback function to convert to GIF if WEBM conversion fails
 func AnimatedWebpConvertToGif(inputData []byte, updateId string) ([]byte, error) {
 	logger := state.State.Logger
 	defer logger.Sync()
@@ -200,10 +342,63 @@ func WebpWriteExifData(inputData []byte) ([]byte, error) {
 	}
 	inputFile.Close()
 
+	outputFile, err := os.CreateTemp("", "exif_out*.webp")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create exif output file: %w", err)
+	}
+	defer os.Remove(outputFile.Name())
+	outputFile.Close()
+
 	cmd := exec.Command("webpmux",
 		"-set", "exif", exifFile.Name(),
 		inputFile.Name(),
-		"-o", "-",
+		"-o", outputFile.Name(),
+	)
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		logger.Debug("failed to run webpmux command",
+			zap.Error(err),
+			zap.String("stderr", stderr.String()),
+		)
+		return nil, err
+	}
+
+	return os.ReadFile(outputFile.Name())
+}
+
+func GenerateVideoThumbnail(videoData []byte) ([]byte, error) {
+	logger := state.State.Logger
+	defer logger.Sync()
+
+	ffmpegExec := state.State.Config.FfmpegExecutable
+	if ffmpegExec == "" {
+		ffmpegExec = "ffmpeg"
+	}
+
+	tempFile, err := os.CreateTemp("", "thumb_input_*")
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temp file for thumbnail: %w", err)
+	}
+	defer os.Remove(tempFile.Name())
+
+	if _, err := tempFile.Write(videoData); err != nil {
+		tempFile.Close()
+		return nil, fmt.Errorf("failed to write temp file for thumbnail: %w", err)
+	}
+	tempFile.Close()
+
+	cmd := exec.Command(ffmpegExec,
+		"-i", tempFile.Name(),
+		"-vframes", "1",
+		"-vf", "scale=160:160:force_original_aspect_ratio=decrease",
+		"-f", "image2",
+		"-c:v", "mjpeg",
+		"-q:v", "8",
+		"-y",
+		"-",
 	)
 
 	var outputBuf, stderr bytes.Buffer
@@ -211,7 +406,7 @@ func WebpWriteExifData(inputData []byte) ([]byte, error) {
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		logger.Debug("failed to run webpmux command",
+		logger.Debug("ffmpeg thumbnail generation failed",
 			zap.Error(err),
 			zap.String("stderr", stderr.String()),
 		)

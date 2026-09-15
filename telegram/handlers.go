@@ -1344,18 +1344,19 @@ func TgMakeMenuKeyboard() *gotgbot.InlineKeyboardMarkup {
 	return &gotgbot.InlineKeyboardMarkup{
 		InlineKeyboard: [][]gotgbot.InlineKeyboardButton{
 			{
-				{Text: "📋 WhatsApp Groups", CallbackData: "menu_groups"},
+				{Text: "📊 Bridge Status", CallbackData: "menu_status"},
+				{Text: "📋 WhatsApp Groups", CallbackData: "menu_groups_0"},
+			},
+			{
 				{Text: "🔄 Sync Contacts", CallbackData: "menu_sync"},
-			},
-			{
 				{Text: "⚙️ Chat & Threads", CallbackData: "menu_chats"},
+			},
+			{
 				{Text: "🛠️ Tools & Utils", CallbackData: "menu_tools"},
-			},
-			{
 				{Text: "🔌 Restart WhatsApp", CallbackData: "menu_restartwa"},
-				{Text: "❓ Help", CallbackData: "menu_help"},
 			},
 			{
+				{Text: "❓ Help", CallbackData: "menu_help"},
 				{Text: "❌ Close Menu", CallbackData: "menu_close"},
 			},
 		},
@@ -1476,6 +1477,172 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 		c.CallbackQuery.Data = "menu_chats"
 		return MenuCallbackHandler(b, c)
 
+	} else if strings.HasPrefix(data, "menu_groups_") || data == "menu_groups" {
+		page := 0
+		if strings.HasPrefix(data, "menu_groups_") {
+			fmt.Sscanf(strings.TrimPrefix(data, "menu_groups_"), "%d", &page)
+		}
+
+		waClient := state.State.WhatsAppClient
+		waGroups, err := waClient.GetJoinedGroups(context.Background())
+		if err != nil {
+			cq.Answer(b, &gotgbot.AnswerCallbackQueryOpts{Text: "Failed to fetch groups: " + err.Error(), ShowAlert: true})
+			return err
+		}
+
+		itemsPerPage := 8
+		totalPages := (len(waGroups) + itemsPerPage - 1) / itemsPerPage
+		if totalPages == 0 {
+			totalPages = 1
+		}
+		if page >= totalPages {
+			page = 0
+		}
+		if page < 0 {
+			page = 0
+		}
+		startIdx := page * itemsPerPage
+		endIdx := startIdx + itemsPerPage
+		if endIdx > len(waGroups) {
+			endIdx = len(waGroups)
+		}
+
+		outputString := fmt.Sprintf("📋 <b>WhatsApp Groups</b> (Page %d/%d - Total %d):\n\n", page+1, totalPages, len(waGroups))
+		for i := startIdx; i < endIdx; i++ {
+			group := waGroups[i]
+			outputString += fmt.Sprintf("%d. <b>%s</b>\n   ↳ <code>%s</code>\n",
+				i+1, html.EscapeString(group.Name),
+				html.EscapeString(group.JID.String()))
+		}
+
+		var buttons [][]gotgbot.InlineKeyboardButton
+		var navRow []gotgbot.InlineKeyboardButton
+		if page > 0 {
+			navRow = append(navRow, gotgbot.InlineKeyboardButton{
+				Text:         "◀️ Prev",
+				CallbackData: fmt.Sprintf("menu_groups_%d", page-1),
+			})
+		}
+		if endIdx < len(waGroups) {
+			navRow = append(navRow, gotgbot.InlineKeyboardButton{
+				Text:         "▶️ Next",
+				CallbackData: fmt.Sprintf("menu_groups_%d", page+1),
+			})
+		}
+		if len(navRow) > 0 {
+			buttons = append(buttons, navRow)
+		}
+		buttons = append(buttons, []gotgbot.InlineKeyboardButton{{
+			Text:         "🔙 Back",
+			CallbackData: "menu_main",
+		}})
+
+		_, _, err = b.EditMessageText(outputString, &gotgbot.EditMessageTextOpts{
+			ChatId:      c.EffectiveChat.Id,
+			MessageId:   c.EffectiveMessage.MessageId,
+			ReplyMarkup: gotgbot.InlineKeyboardMarkup{InlineKeyboard: buttons},
+			ParseMode:   "HTML",
+		})
+		_, _ = cq.Answer(b, nil)
+		return err
+
+	} else if strings.HasPrefix(data, "menu_group_members_") || data == "menu_group_members" {
+		page := 0
+		if strings.HasPrefix(data, "menu_group_members_") {
+			fmt.Sscanf(strings.TrimPrefix(data, "menu_group_members_"), "%d", &page)
+		}
+
+		waChatID, err := database.ChatThreadGetWaFromTg(c.EffectiveChat.Id, c.EffectiveMessage.MessageThreadId)
+		if err != nil || waChatID == "" {
+			cq.Answer(b, &gotgbot.AnswerCallbackQueryOpts{Text: "Thread not linked or error", ShowAlert: true})
+			return err
+		}
+		groupJID, ok := utils.WaParseJID(waChatID)
+		if !ok || groupJID.Server != waTypes.GroupServer {
+			cq.Answer(b, &gotgbot.AnswerCallbackQueryOpts{Text: "This thread is not a WhatsApp group", ShowAlert: true})
+			return nil
+		}
+
+		groupInfo, err := state.State.WhatsAppClient.GetGroupInfo(context.Background(), groupJID)
+		if err != nil {
+			cq.Answer(b, &gotgbot.AnswerCallbackQueryOpts{Text: "Failed to get group info: " + err.Error(), ShowAlert: true})
+			return err
+		}
+
+		itemsPerPage := 12
+		totalPages := (len(groupInfo.Participants) + itemsPerPage - 1) / itemsPerPage
+		if totalPages == 0 {
+			totalPages = 1
+		}
+		if page >= totalPages {
+			page = 0
+		}
+		if page < 0 {
+			page = 0
+		}
+		startIdx := page * itemsPerPage
+		endIdx := startIdx + itemsPerPage
+		if endIdx > len(groupInfo.Participants) {
+			endIdx = len(groupInfo.Participants)
+		}
+
+		outputString := fmt.Sprintf("👥 <b>Group Members for %s</b> (Page %d/%d - Total %d):\n\n",
+			html.EscapeString(groupInfo.Name), page+1, totalPages, len(groupInfo.Participants))
+
+		for i := startIdx; i < endIdx; i++ {
+			participant := groupInfo.Participants[i]
+			participantJID := participant.JID.ToNonAD()
+			memberName := utils.WaGetContactName(participantJID)
+			if memberName == "" {
+				memberName = participantJID.User
+			}
+
+			adminBadge := ""
+			if participant.IsSuperAdmin {
+				adminBadge = " 👑 <i>(Creator)</i>"
+			} else if participant.IsAdmin {
+				adminBadge = " ⭐️ <i>(Admin)</i>"
+			}
+
+			outputString += fmt.Sprintf("%d. <i>%s</i>%s\n   ↳ <code>%s</code>\n",
+				i+1,
+				html.EscapeString(memberName),
+				adminBadge,
+				html.EscapeString(participantJID.String()),
+			)
+		}
+
+		var buttons [][]gotgbot.InlineKeyboardButton
+		var navRow []gotgbot.InlineKeyboardButton
+		if page > 0 {
+			navRow = append(navRow, gotgbot.InlineKeyboardButton{
+				Text:         "◀️ Prev",
+				CallbackData: fmt.Sprintf("menu_group_members_%d", page-1),
+			})
+		}
+		if endIdx < len(groupInfo.Participants) {
+			navRow = append(navRow, gotgbot.InlineKeyboardButton{
+				Text:         "▶️ Next",
+				CallbackData: fmt.Sprintf("menu_group_members_%d", page+1),
+			})
+		}
+		if len(navRow) > 0 {
+			buttons = append(buttons, navRow)
+		}
+		buttons = append(buttons, []gotgbot.InlineKeyboardButton{{
+			Text:         "🔙 Back",
+			CallbackData: "menu_chats",
+		}})
+
+		_, _, err = b.EditMessageText(outputString, &gotgbot.EditMessageTextOpts{
+			ChatId:      c.EffectiveChat.Id,
+			MessageId:   c.EffectiveMessage.MessageId,
+			ReplyMarkup: gotgbot.InlineKeyboardMarkup{InlineKeyboard: buttons},
+			ParseMode:   "HTML",
+		})
+		_, _ = cq.Answer(b, nil)
+		return err
+
 	} else {
 		switch data {
 		case "menu_main":
@@ -1486,42 +1653,72 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 				ReplyMarkup: *keyboard,
 				ParseMode:   "HTML",
 			})
-			cq.Answer(b, nil)
+			_, _ = cq.Answer(b, nil)
 			return err
 
-		case "menu_groups":
+		case "menu_status":
 			waClient := state.State.WhatsAppClient
-			waGroups, err := waClient.GetJoinedGroups(context.Background())
-			if err != nil {
-				cq.Answer(b, &gotgbot.AnswerCallbackQueryOpts{Text: "Failed to fetch groups", ShowAlert: true})
-				return err
+			waConnected := waClient != nil && waClient.IsConnected()
+			waStatusEmoji := "🔴 Disconnected"
+			if waConnected {
+				waStatusEmoji = "🟢 Connected"
 			}
 
-			outputString := "<b>WhatsApp Groups:</b>\n\n"
-			for groupNum, group := range waGroups {
-				outputString += fmt.Sprintf("%v. %s [ <code>%s</code> ]\n",
-					groupNum+1, html.EscapeString(group.Name),
-					html.EscapeString(group.JID.String()))
-				if len(outputString) >= 1500 {
-					outputString += "\n<i>...list truncated, too many groups...</i>"
-					break
-				}
+			var phone, pushName string
+			if waClient != nil && waClient.Store != nil && waClient.Store.ID != nil {
+				phone = waClient.Store.ID.User
+				pushName = waClient.Store.PushName
+			}
+			if phone == "" {
+				phone = "N/A"
+			}
+			if pushName == "" {
+				pushName = "N/A"
 			}
 
-			backKeyboard := &gotgbot.InlineKeyboardMarkup{
-				InlineKeyboard: [][]gotgbot.InlineKeyboardButton{{{
-					Text:         "🔙 Back",
-					CallbackData: "menu_main",
-				}}},
+			startTime := state.State.StartTime
+			upTime := time.Now().UTC().Sub(startTime).Round(time.Second)
+			threadsCount, _ := database.ChatThreadGetPairsCount(c.EffectiveChat.Id)
+			msgPairsCount, _ := database.MsgIdGetPairsCount()
+
+			statusText := "📊 <b>WaTgBridge System Status</b>\n\n"
+			statusText += fmt.Sprintf("<b>WhatsApp Status:</b> %s\n", waStatusEmoji)
+			statusText += fmt.Sprintf("• <b>Account:</b> +%s (<i>%s</i>)\n", html.EscapeString(phone), html.EscapeString(pushName))
+			statusText += fmt.Sprintf("• <b>Mode:</b> <code>%s</code>\n\n", html.EscapeString(state.State.Config.WhatsApp.ClientMode))
+
+			statusText += "<b>Telegram Bot:</b>\n"
+			if b.User.Username != "" {
+				statusText += fmt.Sprintf("• <b>Username:</b> @%s\n", html.EscapeString(b.User.Username))
+			}
+			statusText += fmt.Sprintf("• <b>Target Chat ID:</b> <code>%d</code>\n", state.State.Config.Telegram.TargetChatID)
+			statusText += fmt.Sprintf("• <b>Owner ID:</b> <code>%d</code>\n\n", state.State.Config.Telegram.OwnerID)
+
+			statusText += "<b>Statistics & Performance:</b>\n"
+			statusText += fmt.Sprintf("• <b>Mapped Threads:</b> %d\n", threadsCount)
+			statusText += fmt.Sprintf("• <b>Stored Message Pairs:</b> %d\n", msgPairsCount)
+			statusText += fmt.Sprintf("• <b>Up Since:</b> %s\n", startTime.In(state.State.LocalLocation).Format(state.State.Config.TimeFormat))
+			statusText += fmt.Sprintf("• <b>Uptime:</b> <code>%s</code>\n", upTime.String())
+			statusText += fmt.Sprintf("• <b>Version:</b> <code>%s</code>\n", state.WATGBRIDGE_VERSION)
+
+			statusKeyboard := &gotgbot.InlineKeyboardMarkup{
+				InlineKeyboard: [][]gotgbot.InlineKeyboardButton{
+					{
+						{Text: "🔄 Refresh", CallbackData: "menu_status"},
+						{Text: "💾 Backup DB", CallbackData: "menu_trigger_backup"},
+					},
+					{
+						{Text: "🔙 Back", CallbackData: "menu_main"},
+					},
+				},
 			}
 
-			_, _, err = b.EditMessageText(outputString, &gotgbot.EditMessageTextOpts{
+			_, _, err := b.EditMessageText(statusText, &gotgbot.EditMessageTextOpts{
 				ChatId:      c.EffectiveChat.Id,
 				MessageId:   c.EffectiveMessage.MessageId,
-				ReplyMarkup: *backKeyboard,
+				ReplyMarkup: *statusKeyboard,
 				ParseMode:   "HTML",
 			})
-			cq.Answer(b, nil)
+			_, _ = cq.Answer(b, nil)
 			return err
 
 		case "menu_sync":
@@ -1578,7 +1775,13 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 				var rows [][]gotgbot.InlineKeyboardButton
 				if waChatJID.Server == waTypes.GroupServer {
 					rows = append(rows, []gotgbot.InlineKeyboardButton{
-						{Text: "👥 Group Members", CallbackData: "menu_group_members"},
+						{Text: "👥 Group Members", CallbackData: "menu_group_members_0"},
+						{Text: "🖼️ Profile Picture", CallbackData: "menu_chat_profilepic"},
+					})
+				} else {
+					rows = append(rows, []gotgbot.InlineKeyboardButton{
+						{Text: "🖼️ Profile Picture", CallbackData: "menu_chat_profilepic"},
+						{Text: "🚫 Block Contact", CallbackData: "menu_exp_block"},
 					})
 				}
 				rows = append(rows,
@@ -1607,11 +1810,17 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 						},
 					}
 				} else {
-					text = "<b>Chat & Thread Management</b>\n\nStatus: ❌ <b>Unlinked</b>\n\n<i>This thread is not mapped to any WhatsApp chat. You can link it using the button below.</i>"
+					text = "<b>Chat & Thread Management</b>\n\nStatus: ❌ <b>Unlinked</b>\n\n<i>This thread is not mapped to any WhatsApp chat. Select an option below:</i>"
 					keyboard = &gotgbot.InlineKeyboardMarkup{
 						InlineKeyboard: [][]gotgbot.InlineKeyboardButton{
 							{
-								{Text: "📌 Link to WhatsApp Chat", CallbackData: "menu_linkpage_0"},
+								{Text: "📌 Link WhatsApp Group", CallbackData: "menu_linkpage_0"},
+							},
+							{
+								{Text: "👤 Link Private Chat", CallbackData: "menu_exp_settargetprivatechat"},
+							},
+							{
+								{Text: "📁 Sync Topic Names (All)", CallbackData: "menu_sync_topics"},
 							},
 							{
 								{Text: "🔙 Back", CallbackData: "menu_main"},
@@ -1627,62 +1836,7 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 				ReplyMarkup: *keyboard,
 				ParseMode:   "HTML",
 			})
-			cq.Answer(b, nil)
-			return err
-
-		case "menu_group_members":
-			waChatID, err := database.ChatThreadGetWaFromTg(c.EffectiveChat.Id, c.EffectiveMessage.MessageThreadId)
-			if err != nil || waChatID == "" {
-				cq.Answer(b, &gotgbot.AnswerCallbackQueryOpts{Text: "Thread not linked or error", ShowAlert: true})
-				return err
-			}
-			groupJID, ok := utils.WaParseJID(waChatID)
-			if !ok || groupJID.Server != waTypes.GroupServer {
-				cq.Answer(b, &gotgbot.AnswerCallbackQueryOpts{Text: "This thread is not a WhatsApp group", ShowAlert: true})
-				return nil
-			}
-
-			cq.Answer(b, &gotgbot.AnswerCallbackQueryOpts{Text: "Fetching group members..."})
-
-			groupInfo, err := state.State.WhatsAppClient.GetGroupInfo(context.Background(), groupJID)
-			if err != nil {
-				cq.Answer(b, &gotgbot.AnswerCallbackQueryOpts{Text: "Failed to get group info: " + err.Error(), ShowAlert: true})
-				return err
-			}
-
-			outputString := fmt.Sprintf("👥 <b>Group members for %s (%d):</b>\n\n", html.EscapeString(groupInfo.Name), len(groupInfo.Participants))
-			for i, participant := range groupInfo.Participants {
-				participantJID := participant.JID.ToNonAD()
-				memberName := utils.WaGetContactName(participantJID)
-				if memberName == "" {
-					memberName = participantJID.User
-				}
-
-				outputString += fmt.Sprintf("%d. <i>%s</i> [ <code>%s</code> ]\n",
-					i+1,
-					html.EscapeString(memberName),
-					html.EscapeString(participantJID.String()),
-				)
-
-				if len(outputString) >= 1500 {
-					outputString += "\n<i>...list truncated, too many members...</i>"
-					break
-				}
-			}
-
-			backKeyboard := &gotgbot.InlineKeyboardMarkup{
-				InlineKeyboard: [][]gotgbot.InlineKeyboardButton{{{
-					Text:         "🔙 Back",
-					CallbackData: "menu_chats",
-				}}},
-			}
-
-			_, _, err = b.EditMessageText(outputString, &gotgbot.EditMessageTextOpts{
-				ChatId:      c.EffectiveChat.Id,
-				MessageId:   c.EffectiveMessage.MessageId,
-				ReplyMarkup: *backKeyboard,
-				ParseMode:   "HTML",
-			})
+			_, _ = cq.Answer(b, nil)
 			return err
 
 		case "menu_unlink_current":
@@ -1700,7 +1854,7 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 				InlineKeyboard: [][]gotgbot.InlineKeyboardButton{
 					{
 						{Text: "🔍 Find Contact JID", CallbackData: "menu_exp_findcontact"},
-						{Text: "🖼️ Get Profile Picture", CallbackData: "menu_exp_getprofilepicture"},
+						{Text: "🔗 Join via Invite", CallbackData: "menu_exp_joininvitelink"},
 					},
 					{
 						{Text: "🚫 Block User", CallbackData: "menu_exp_block"},
@@ -1725,7 +1879,7 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 				ReplyMarkup: *keyboard,
 				ParseMode:   "HTML",
 			})
-			cq.Answer(b, nil)
+			_, _ = cq.Answer(b, nil)
 			return err
 
 		case "menu_restartwa":
@@ -2006,7 +2160,30 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 			cq.Answer(b, nil)
 			return err
 
+		case "menu_exp_joininvitelink":
+			backKeyboard := &gotgbot.InlineKeyboardMarkup{
+				InlineKeyboard: [][]gotgbot.InlineKeyboardButton{{{
+					Text:         "🔙 Back",
+					CallbackData: "menu_tools",
+				}}},
+			}
+			_, _, err := b.EditMessageText("<b>🔗 Join via WhatsApp Invite Link</b>\n\nTo join a WhatsApp group using an invite link, send:\n\n<code>/joininvitelink &lt;invite_link&gt;</code>\n\n<i>Example: /joininvitelink https://chat.whatsapp.com/AbCdEfGh...</i>", &gotgbot.EditMessageTextOpts{
+				ChatId:      c.EffectiveChat.Id,
+				MessageId:   c.EffectiveMessage.MessageId,
+				ReplyMarkup: *backKeyboard,
+				ParseMode:   "HTML",
+			})
+			cq.Answer(b, nil)
+			return err
+
+		case "menu_chat_profilepic":
+			fallthrough
 		case "menu_exp_getprofilepicture":
+			returnTarget := "menu_tools"
+			if data == "menu_chat_profilepic" {
+				returnTarget = "menu_chats"
+			}
+
 			waChatID, err := database.ChatThreadGetWaFromTg(c.EffectiveChat.Id, c.EffectiveMessage.MessageThreadId)
 			if err == nil && waChatID != "" {
 				cq.Answer(b, &gotgbot.AnswerCallbackQueryOpts{Text: "Fetching profile picture..."})
@@ -2021,7 +2198,7 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 
 				ppInfo, err := waClient.GetProfilePictureInfo(context.Background(), userJID, &whatsmeow.GetProfilePictureParams{})
 				if err != nil {
-					backKeyboard := &gotgbot.InlineKeyboardMarkup{InlineKeyboard: [][]gotgbot.InlineKeyboardButton{{{Text: "🔙 Back", CallbackData: "menu_tools"}}}}
+					backKeyboard := &gotgbot.InlineKeyboardMarkup{InlineKeyboard: [][]gotgbot.InlineKeyboardButton{{{Text: "🔙 Back", CallbackData: returnTarget}}}}
 					_, _, _ = b.EditMessageText("❌ <b>Failed to fetch profile picture info from WhatsApp:</b>\n"+html.EscapeString(err.Error()), &gotgbot.EditMessageTextOpts{
 						ChatId:      c.EffectiveChat.Id,
 						MessageId:   c.EffectiveMessage.MessageId,
@@ -2033,7 +2210,7 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 
 				res, err := http.DefaultClient.Get(ppInfo.URL)
 				if err != nil {
-					backKeyboard := &gotgbot.InlineKeyboardMarkup{InlineKeyboard: [][]gotgbot.InlineKeyboardButton{{{Text: "🔙 Back", CallbackData: "menu_tools"}}}}
+					backKeyboard := &gotgbot.InlineKeyboardMarkup{InlineKeyboard: [][]gotgbot.InlineKeyboardButton{{{Text: "🔙 Back", CallbackData: returnTarget}}}}
 					_, _, _ = b.EditMessageText("❌ <b>Failed to download photo:</b>\n"+html.EscapeString(err.Error()), &gotgbot.EditMessageTextOpts{
 						ChatId:      c.EffectiveChat.Id,
 						MessageId:   c.EffectiveMessage.MessageId,
@@ -2053,14 +2230,14 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 					_, _ = b.SendPhoto(c.EffectiveChat.Id, &gotgbot.FileReader{Data: bytes.NewReader(imgBytes)}, opts)
 				}
 
-				c.CallbackQuery.Data = "menu_tools"
+				c.CallbackQuery.Data = returnTarget
 				return MenuCallbackHandler(b, c)
 			}
 
 			backKeyboard := &gotgbot.InlineKeyboardMarkup{
 				InlineKeyboard: [][]gotgbot.InlineKeyboardButton{{{
 					Text:         "🔙 Back",
-					CallbackData: "menu_tools",
+					CallbackData: returnTarget,
 				}}},
 			}
 			_, _, err = b.EditMessageText("<b>🖼️ Get Profile Picture</b>\n\nTo fetch the profile picture of a JID, send:\n\n<code>/getprofilepicture &lt;jid&gt;</code>\n\n<i>Example: /getprofilepicture 120363042@g.us</i>", &gotgbot.EditMessageTextOpts{

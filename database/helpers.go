@@ -290,6 +290,22 @@ func ChatThreadDropAllPairs() error {
 	return res.Error
 }
 
+func ChatThreadGetPairsCount(tgChatId int64) (int64, error) {
+	var count int64
+	query := state.State.Database.Model(&ChatThreadPair{})
+	if tgChatId != 0 {
+		query = query.Where("tg_chat_id = ?", tgChatId)
+	}
+	res := query.Count(&count)
+	return count, res.Error
+}
+
+func MsgIdGetPairsCount() (int64, error) {
+	var count int64
+	res := state.State.Database.Model(&MsgIdPair{}).Count(&count)
+	return count, res.Error
+}
+
 func ContactNameAddNew(waUserId, waUserServer, firstName, fullName, pushName, businessName string) error {
 	db := state.State.Database
 

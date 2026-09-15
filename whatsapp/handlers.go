@@ -721,6 +721,8 @@ func MessageFromOthersEventHandler(text string, v *events.Message, isEdited bool
 		v.Message.GetPollCreationMessageV2() != nil ||
 		v.Message.GetPollCreationMessageV3() != nil:
 		bc.handlePollMessage(v)
+	case v.Message.GetPollUpdateMessage() != nil:
+		bc.handlePollUpdateMessage(v)
 	case v.Message.GetEventMessage() != nil:
 		bc.handleEventMessage(v)
 	default:
@@ -1149,6 +1151,57 @@ func (bc *bridgeContext) handlePollMessage(v *events.Message) {
 		pollMsg = i
 	}
 
+	if pollMsg == nil {
+		return
+	}
+
+	rawOptions := pollMsg.GetOptions()
+	// Attempt to send a native Telegram poll if options count is within Telegram's supported limits (2 to 12)
+	if len(rawOptions) >= 2 && len(rawOptions) <= 12 {
+		question := pollMsg.GetName()
+		if len(question) > 300 {
+			question = question[:297] + "..."
+		}
+		if strings.TrimSpace(question) == "" {
+			question = "WhatsApp Poll"
+		}
+
+		var pollOptions []gotgbot.InputPollOption
+		var optionNames []string
+		for _, opt := range rawOptions {
+			name := opt.GetOptionName()
+			if len(name) > 100 {
+				name = name[:97] + "..."
+			}
+			if strings.TrimSpace(name) == "" {
+				name = "-"
+			}
+			pollOptions = append(pollOptions, gotgbot.InputPollOption{Text: name})
+			optionNames = append(optionNames, opt.GetOptionName())
+		}
+
+		allowsMultiple := pollMsg.GetSelectableOptionsCount() > 1 || pollMsg.GetSelectableOptionsCount() == 0
+
+		sentMsg, err := bc.tgBot.SendPoll(bc.cfg.Telegram.TargetChatID, question, pollOptions, &gotgbot.SendPollOpts{
+			IsAnonymous:           proto.Bool(false),
+			AllowsMultipleAnswers: allowsMultiple,
+			ReplyParameters:       utils.TgMakeReplyParameters(bc.replyToMsgId, 0),
+			MessageThreadId:       bc.threadId,
+		})
+		if err == nil && sentMsg != nil && sentMsg.Poll != nil {
+			bc.savePair(sentMsg)
+			senderID := v.Info.Sender.String()
+			if senderID == "" {
+				senderID = v.Info.Chat.String()
+			}
+			_ = database.PollPairAddNew(sentMsg.Poll.Id, v.Info.ID, v.Info.Chat.String(), senderID,
+				bc.cfg.Telegram.TargetChatID, bc.threadId, sentMsg.MessageId, optionNames)
+			return
+		}
+		bc.logger.Warn("failed to send native Telegram poll, falling back to text", zap.Error(err))
+	}
+
+	// Fallback to formatted text
 	bc.bridgedText += "\n<i>It was the following poll:</i>\n\n"
 	bc.bridgedText += fmt.Sprintf("<b>%s</b>: (%v options selectable)\n\n",
 		html.EscapeString(pollMsg.GetName()), pollMsg.GetSelectableOptionsCount())
@@ -1167,6 +1220,62 @@ func (bc *bridgeContext) handlePollMessage(v *events.Message) {
 			MessageThreadId: bc.threadId,
 		})
 	bc.savePair(sentMsg)
+}
+
+func (bc *bridgeContext) handlePollUpdateMessage(v *events.Message) {
+	waClient := state.State.WhatsAppClient
+	pollVote, err := waClient.DecryptPollVote(context.Background(), v)
+	if err != nil {
+		bc.logger.Debug("failed to decrypt poll vote", zap.Error(err))
+		return
+	}
+
+	pollUpdate := v.Message.GetPollUpdateMessage()
+	if pollUpdate == nil || pollUpdate.GetPollCreationMessageKey() == nil {
+		return
+	}
+
+	waPollMsgID := pollUpdate.GetPollCreationMessageKey().GetID()
+	pollPair, err := database.PollPairGetByWaMsgID(waPollMsgID, v.Info.Chat.String())
+	if err != nil || pollPair.PollID == "" {
+		return
+	}
+
+	var allOptionNames []string
+	_ = json.Unmarshal([]byte(pollPair.OptionNames), &allOptionNames)
+
+	var votedOptionNames []string
+	for _, hash := range pollVote.GetSelectedOptions() {
+		for _, name := range allOptionNames {
+			hashed := whatsmeow.HashPollOptions([]string{name})
+			if len(hashed) > 0 && bytes.Equal(hashed[0], hash) {
+				votedOptionNames = append(votedOptionNames, name)
+				break
+			}
+		}
+	}
+
+	voterName := utils.WaGetContactName(v.Info.Sender)
+	if voterName == "" {
+		voterName = v.Info.Sender.User
+	}
+
+	var voteText string
+	if len(votedOptionNames) == 0 {
+		voteText = fmt.Sprintf("🗳️ <b>%s</b> retracted their vote in the poll", html.EscapeString(voterName))
+	} else {
+		voteText = fmt.Sprintf("🗳️ <b>%s</b> voted for: <b>%s</b>", html.EscapeString(voterName), html.EscapeString(strings.Join(votedOptionNames, ", ")))
+	}
+
+	replyTo := pollPair.TgMsgID
+	sentMsg, err := bc.tgBot.SendMessage(bc.cfg.Telegram.TargetChatID, voteText, &gotgbot.SendMessageOpts{
+		MessageThreadId: bc.threadId,
+		ReplyParameters: utils.TgMakeReplyParameters(replyTo, 0),
+		ParseMode:       "HTML",
+	})
+	if err == nil && sentMsg != nil {
+		bc.savePair(sentMsg)
+	}
 }
 
 func (bc *bridgeContext) handleEventMessage(v *events.Message) {

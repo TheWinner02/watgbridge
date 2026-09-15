@@ -72,6 +72,8 @@ func NewTelegramClient() error {
 				"callback_query",
 				"my_chat_member",
 				"chat_member",
+				"poll",
+				"poll_answer",
 			},
 			RequestOpts: &gotgbot.RequestOpts{
 				Timeout: 10 * time.Second,

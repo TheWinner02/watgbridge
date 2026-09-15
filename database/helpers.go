@@ -2,6 +2,7 @@ package database
 
 import (
 	"database/sql"
+	"encoding/json"
 	"strings"
 	"time"
 
@@ -501,4 +502,37 @@ func GetEphemeralSettings(waChatId string) (bool, uint32, bool, error) {
 	}
 
 	return settings.IsEphemeral, settings.EphemeralTimer, true, nil
+}
+
+func PollPairAddNew(pollID, waMsgID, waChatID, waSenderID string, tgChatID, tgThreadID, tgMsgID int64, optionNames []string) error {
+	db := state.State.Database
+	optionsJSON, _ := json.Marshal(optionNames)
+
+	pair := PollPair{
+		PollID:      pollID,
+		WaMsgID:     waMsgID,
+		WaChatID:    waChatID,
+		WaSenderID:  waSenderID,
+		TgChatID:    tgChatID,
+		TgThreadID:  tgThreadID,
+		TgMsgID:     tgMsgID,
+		OptionNames: string(optionsJSON),
+	}
+
+	res := db.Save(&pair)
+	return res.Error
+}
+
+func PollPairGetByPollID(pollID string) (PollPair, error) {
+	db := state.State.Database
+	var pair PollPair
+	res := db.Where("poll_id = ?", pollID).Find(&pair)
+	return pair, res.Error
+}
+
+func PollPairGetByWaMsgID(waMsgID, waChatID string) (PollPair, error) {
+	db := state.State.Database
+	var pair PollPair
+	res := db.Where("wa_msg_id = ? AND wa_chat_id = ?", waMsgID, waChatID).Find(&pair)
+	return pair, res.Error
 }

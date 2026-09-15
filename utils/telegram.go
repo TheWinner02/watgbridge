@@ -1102,6 +1102,48 @@ func TgSendToWhatsApp(b *gotgbot.Bot, c *ext.Context,
 			return TgReplyWithErrorByContext(b, c, "Failed to add to database", err)
 		}
 
+	} else if msgToForward.Poll != nil {
+		poll := msgToForward.Poll
+		question := poll.Question
+		var optionNames []string
+		for _, opt := range poll.Options {
+			optionNames = append(optionNames, opt.Text)
+		}
+
+		selectableCount := 1
+		if poll.AllowsMultipleAnswers {
+			selectableCount = len(optionNames)
+		}
+
+		pollMsg := waClient.BuildPollCreation(question, optionNames, selectableCount)
+		if pollMsg.PollCreationMessage != nil {
+			if pollMsg.PollCreationMessage.ContextInfo == nil {
+				pollMsg.PollCreationMessage.ContextInfo = &waE2E.ContextInfo{}
+			}
+			if isReply {
+				WaSetReplyContext(pollMsg.PollCreationMessage.ContextInfo, stanzaId, participant, replyRemoteJID)
+			}
+			if isEphemeral {
+				pollMsg.PollCreationMessage.ContextInfo.Expiration = &ephemeralTimer
+			}
+		}
+
+		sentMsg, err := waClient.SendMessage(context.Background(), waChatJID, pollMsg)
+		if err != nil {
+			return TgReplyWithErrorByContext(b, c, "Failed to send poll to WhatsApp", err)
+		}
+		revokeKeyboard := TgMakeRevokeKeyboard(sentMsg.ID, waChatJID.String(), false)
+		SendMessageConfirmation(b, c, cfg, msgToForward, revokeKeyboard)
+
+		err = database.MsgIdAddNewPair(sentMsg.ID, waClient.Store.ID.String(), waChatJID.String(),
+			cfg.Telegram.TargetChatID, msgToForward.MessageId, msgToForward.MessageThreadId)
+		if err != nil {
+			return TgReplyWithErrorByContext(b, c, "Failed to add to database", err)
+		}
+
+		_ = database.PollPairAddNew(poll.Id, sentMsg.ID, waChatJID.String(), waClient.Store.ID.String(),
+			cfg.Telegram.TargetChatID, msgToForward.MessageThreadId, msgToForward.MessageId, optionNames)
+
 	} else if msgToForward.Text != "" {
 
 		if emojis := gomoji.CollectAll(msgToForward.Text); isReply && len(emojis) == 1 && gomoji.RemoveEmojis(msgToForward.Text) == "" {

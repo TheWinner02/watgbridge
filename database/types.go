@@ -51,6 +51,17 @@ type MessageReceipt struct {
 	ReceiptTime   time.Time
 }
 
+type PollPair struct {
+	PollID      string `gorm:"primaryKey;"` // Telegram Poll ID
+	WaMsgID     string `gorm:"index"`       // WhatsApp Message ID
+	WaChatID    string                      // WhatsApp Chat JID
+	WaSenderID  string                      // WhatsApp Sender JID (for encryption)
+	TgChatID    int64
+	TgThreadID  int64
+	TgMsgID     int64
+	OptionNames string // JSON array of string options
+}
+
 func AutoMigrate() error {
 	db := state.State.Database
 	return db.AutoMigrate(
@@ -59,5 +70,6 @@ func AutoMigrate() error {
 		&ContactName{},
 		&ChatEphemeralSettings{},
 		&MessageReceipt{},
+		&PollPair{},
 	)
 }

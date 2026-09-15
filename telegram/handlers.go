@@ -3,6 +3,7 @@ package telegram
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"html"
@@ -31,6 +32,7 @@ import (
 	waTypes "go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	"go.uber.org/zap"
+	"golang.org/x/exp/slices"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -200,6 +202,8 @@ func AddTelegramHandlers() {
 		func(cq *gotgbot.CallbackQuery) bool {
 			return cq.Data == "receipt_dismiss"
 		}, ReceiptDismissCallbackHandler), DispatcherCallbackHandlerGroup)
+
+	dispatcher.AddHandler(handlers.NewPollAnswer(nil, PollAnswerHandler))
 }
 
 func BridgeTelegramToWhatsAppHandler(b *gotgbot.Bot, c *ext.Context) error {
@@ -2613,6 +2617,89 @@ func ReceiptDismissCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 	cq := c.CallbackQuery
 	_, _ = b.DeleteMessage(c.EffectiveChat.Id, c.EffectiveMessage.MessageId, &gotgbot.DeleteMessageOpts{})
 	cq.Answer(b, nil)
+	return nil
+}
+
+func PollAnswerHandler(b *gotgbot.Bot, c *ext.Context) error {
+	var (
+		pa     = c.PollAnswer
+		cfg    = state.State.Config
+		logger = state.State.Logger
+	)
+	if pa == nil {
+		return nil
+	}
+	defer logger.Sync()
+
+	// Only process votes from authorized users (owner or sudo)
+	if pa.User == nil {
+		return nil
+	}
+	isOwnerOrSudo := pa.User.Id == cfg.Telegram.OwnerID || slices.Contains(cfg.Telegram.SudoUsersID, pa.User.Id)
+	if !isOwnerOrSudo {
+		return nil
+	}
+
+	pollPair, err := database.PollPairGetByPollID(pa.PollId)
+	if err != nil || pollPair.WaMsgID == "" {
+		return nil
+	}
+
+	var allOptionNames []string
+	if err := json.Unmarshal([]byte(pollPair.OptionNames), &allOptionNames); err != nil {
+		logger.Error("failed to unmarshal poll option names", zap.Error(err))
+		return err
+	}
+
+	var selectedOptionNames []string
+	for _, idx := range pa.OptionIds {
+		if int(idx) >= 0 && int(idx) < len(allOptionNames) {
+			selectedOptionNames = append(selectedOptionNames, allOptionNames[idx])
+		}
+	}
+
+	waChatJID, ok := utils.WaParseJID(pollPair.WaChatID)
+	if !ok {
+		return nil
+	}
+
+	waSenderJID, ok := utils.WaParseJID(pollPair.WaSenderID)
+	if !ok {
+		waSenderJID = waChatJID
+	}
+
+	pollInfo := &waTypes.MessageInfo{
+		ID: pollPair.WaMsgID,
+		MessageSource: waTypes.MessageSource{
+			Chat:   waChatJID,
+			Sender: waSenderJID,
+		},
+	}
+
+	waClient := state.State.WhatsAppClient
+	pollVoteMsg, err := waClient.BuildPollVote(context.Background(), pollInfo, selectedOptionNames)
+	if err != nil {
+		logger.Error("failed to build poll vote for WhatsApp",
+			zap.String("wa_msg_id", pollPair.WaMsgID),
+			zap.Error(err),
+		)
+		return err
+	}
+
+	_, err = waClient.SendMessage(context.Background(), waChatJID, pollVoteMsg)
+	if err != nil {
+		logger.Error("failed to send poll vote to WhatsApp",
+			zap.String("wa_msg_id", pollPair.WaMsgID),
+			zap.Error(err),
+		)
+		return err
+	}
+
+	logger.Info("successfully synced poll vote from Telegram to WhatsApp",
+		zap.String("poll_id", pa.PollId),
+		zap.Strings("selected_options", selectedOptionNames),
+	)
+
 	return nil
 }
 

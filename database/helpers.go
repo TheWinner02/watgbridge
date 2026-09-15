@@ -181,14 +181,17 @@ func MsgReceiptUpsert(waMsgId, waChatId, participantId string, receiptType types
 	db := state.State.Database
 
 	var receipt MessageReceipt
-	res := db.Where("wa_msg_id = ? AND wa_chat_id = ? AND participant_id = ?", waMsgId, waChatId, participantId).Find(&receipt)
+	res := db.Where("wa_msg_id = ? AND participant_id = ?", waMsgId, participantId).Find(&receipt)
 	if res.Error != nil {
 		return res.Error
 	}
 
-	if receipt.WaMsgId == waMsgId && receipt.WaChatId == waChatId && receipt.ParticipantId == participantId {
+	if receipt.WaMsgId == waMsgId && receipt.ParticipantId == participantId {
 		receipt.ReceiptType = string(receiptType)
 		receipt.ReceiptTime = receiptTime
+		if receipt.WaChatId == "" {
+			receipt.WaChatId = waChatId
+		}
 		res = db.Save(&receipt)
 		return res.Error
 	}
@@ -208,6 +211,9 @@ func MsgReceiptGetByMsg(waMsgId, waChatId string) ([]MessageReceipt, error) {
 
 	var receipts []MessageReceipt
 	res := db.Where("wa_msg_id = ? AND wa_chat_id = ?", waMsgId, waChatId).Order("receipt_time DESC").Find(&receipts)
+	if res.Error == nil && len(receipts) == 0 {
+		res = db.Where("wa_msg_id = ?", waMsgId).Order("receipt_time DESC").Find(&receipts)
+	}
 	return receipts, res.Error
 }
 

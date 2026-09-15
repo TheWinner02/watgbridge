@@ -1398,14 +1398,15 @@ var notifiedReceipts sync.Map // key: waChatID:msgId:receiptType:participantID -
 func ReceiptEventHandler(v *events.Receipt) {
 	participantID := v.Sender.ToNonAD().String()
 	waChatID := v.Chat.ToNonAD().String()
+	if participantID == "" {
+		participantID = waChatID
+	}
 	cfg := state.State.Config
 	waClient := state.State.WhatsAppClient
 	tgBot := state.State.TelegramBot
 
 	for _, msgId := range v.MessageIDs {
-		if participantID != "" {
-			database.MsgReceiptUpsert(msgId, waChatID, participantID, v.Type, v.Timestamp)
-		}
+		database.MsgReceiptUpsert(msgId, waChatID, participantID, v.Type, v.Timestamp)
 	}
 
 	if v.Type == waTypes.ReceiptTypeReadSelf {

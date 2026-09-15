@@ -6,19 +6,18 @@ import (
 	"html"
 	"log"
 	"strings"
+	"time"
 
 	"watgbridge/database"
 	"watgbridge/state"
 
 	"github.com/lithammer/fuzzysearch/fuzzy"
+	"go.mau.fi/util/jsontime"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
-	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 )
-
-const querySetStatusMessage = "9152604461510864"
 
 func WaSetStatusMessage(ctx context.Context, waClient *whatsmeow.Client, msg string) error {
 	duration := state.State.Config.WhatsApp.StatusMessageDurationSeconds
@@ -26,21 +25,10 @@ func WaSetStatusMessage(ctx context.Context, waClient *whatsmeow.Client, msg str
 		duration = 86400
 	}
 
-	input := map[string]any{
-		"text":                   msg,
-		"ephemeral_duration_sec": duration,
-	}
-
-	variables := map[string]any{
-		"input": input,
-	}
-
-	_, mexErr := waClient.DangerousInternals().SendMexIQ(ctx, querySetStatusMessage, variables)
-	if mexErr != nil && !strings.Contains(mexErr.Error(), "argo decoding") {
-		state.State.Logger.Debug("SendMexIQ returned error when setting status message", zap.Error(mexErr))
-	}
-
-	return waClient.SetStatusMessage(ctx, msg)
+	return waClient.SetStatusMessage(ctx, types.SetStatusInput{
+		Text:     &msg,
+		Duration: jsontime.S(time.Duration(duration) * time.Second),
+	})
 }
 
 func CleanInviteLink(input string) string {

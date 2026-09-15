@@ -191,12 +191,19 @@ func AddTelegramHandlers() {
 		func(cq *gotgbot.CallbackQuery) bool {
 			return strings.HasPrefix(cq.Data, "ai_send_") || strings.HasPrefix(cq.Data, "ai_discard_")
 		}, AIPendingCallbackHandler), DispatcherCallbackHandlerGroup)
+
+	dispatcher.AddHandlerToGroup(handlers.NewCallback(
+		func(cq *gotgbot.CallbackQuery) bool {
+			return cq.Data == "receipt_dismiss"
+		}, ReceiptDismissCallbackHandler), DispatcherCallbackHandlerGroup)
 }
 
 func BridgeTelegramToWhatsAppHandler(b *gotgbot.Bot, c *ext.Context) error {
 	if !utils.TgUpdateIsAuthorized(b, c) {
 		return nil
 	}
+
+	utils.TgClearPendingReceiptMsgsForThread(b, c.EffectiveChat.Id, c.EffectiveMessage.MessageThreadId)
 
 	for _, command := range commands {
 		if command.command.CheckUpdate(b, c) {
@@ -2419,4 +2426,15 @@ func AIPendingCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 	database.MsgIdAddNewPair(sendResp.ID, waClient.Store.ID.String(), waChatJID.String(), c.EffectiveChat.Id, c.EffectiveMessage.MessageId, entry.TgThreadID)
 	return nil
 }
+
+func ReceiptDismissCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
+	if !utils.TgUpdateIsAuthorized(b, c) {
+		return nil
+	}
+	cq := c.CallbackQuery
+	_, _ = b.DeleteMessage(c.EffectiveChat.Id, c.EffectiveMessage.MessageId, &gotgbot.DeleteMessageOpts{})
+	cq.Answer(b, nil)
+	return nil
+}
+
 

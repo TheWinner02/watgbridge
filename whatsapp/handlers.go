@@ -1449,19 +1449,39 @@ func ReceiptEventHandler(v *events.Receipt) {
 				}
 			}
 
+			dismissKeyboard := utils.TgReceiptMakeDismissKeyboard()
+
+			existingTgMsgId := utils.TgGetExistingReceiptMsg(waChatID, msgId)
+			if existingTgMsgId != 0 && v.Type == waTypes.ReceiptTypeRead {
+				_, _, err := tgBot.EditMessageText(notifText, &gotgbot.EditMessageTextOpts{
+					ChatId:      tgChatId,
+					MessageId:   existingTgMsgId,
+					ReplyMarkup: *dismissKeyboard,
+					ParseMode:   "HTML",
+				})
+				if err == nil {
+					continue
+				}
+			}
+
 			sentMsg, err := tgBot.SendMessage(tgChatId, notifText, &gotgbot.SendMessageOpts{
 				MessageThreadId:     tgThreadId,
 				ReplyParameters:     &gotgbot.ReplyParameters{MessageId: tgMsgId},
+				ReplyMarkup:         dismissKeyboard,
 				ParseMode:           "HTML",
 				DisableNotification: cfg.Telegram.SilentConfirmation,
 			})
-			if err == nil && sentMsg != nil && cfg.Telegram.NotifyReceiptAutoDeleteSeconds > 0 {
-				go func(chatID, messageID int64, delay uint32) {
-					time.Sleep(time.Duration(delay) * time.Second)
-					if state.State.TelegramBot != nil {
-						state.State.TelegramBot.DeleteMessage(chatID, messageID, &gotgbot.DeleteMessageOpts{})
-					}
-				}(tgChatId, sentMsg.MessageId, cfg.Telegram.NotifyReceiptAutoDeleteSeconds)
+			if err == nil && sentMsg != nil {
+				utils.TgRegisterPendingReceiptMsg(tgChatId, tgThreadId, sentMsg.MessageId, waChatID, msgId)
+
+				if cfg.Telegram.NotifyReceiptAutoDeleteSeconds > 0 {
+					go func(chatID, messageID int64, delay uint32) {
+						time.Sleep(time.Duration(delay) * time.Second)
+						if state.State.TelegramBot != nil {
+							state.State.TelegramBot.DeleteMessage(chatID, messageID, &gotgbot.DeleteMessageOpts{})
+						}
+					}(tgChatId, sentMsg.MessageId, cfg.Telegram.NotifyReceiptAutoDeleteSeconds)
+				}
 			}
 		}
 	}

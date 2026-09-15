@@ -10,6 +10,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -1287,3 +1288,63 @@ func SendMessageConfirmation(
 		}
 	}
 }
+
+// -----------------------------------------------------------------------------
+// Pending receipt notifications tracking (Delivered / Read)
+// -----------------------------------------------------------------------------
+
+var (
+	pendingReceiptMsgsLock     sync.Mutex
+	pendingReceiptMsgsByThread = make(map[string][]int64)
+	receiptMsgByWaMsg          = make(map[string]int64)
+)
+
+func TgReceiptMakeDismissKeyboard() *gotgbot.InlineKeyboardMarkup {
+	return &gotgbot.InlineKeyboardMarkup{
+		InlineKeyboard: [][]gotgbot.InlineKeyboardButton{
+			{
+				{Text: "✕ Dismiss", CallbackData: "receipt_dismiss"},
+			},
+		},
+	}
+}
+
+func TgRegisterPendingReceiptMsg(chatId, threadId, msgId int64, waChatId, waMsgId string) {
+	pendingReceiptMsgsLock.Lock()
+	defer pendingReceiptMsgsLock.Unlock()
+
+	threadKey := fmt.Sprintf("%d:%d", chatId, threadId)
+	pendingReceiptMsgsByThread[threadKey] = append(pendingReceiptMsgsByThread[threadKey], msgId)
+
+	if waChatId != "" && waMsgId != "" {
+		waKey := fmt.Sprintf("%s:%s", waChatId, waMsgId)
+		receiptMsgByWaMsg[waKey] = msgId
+	}
+}
+
+func TgGetExistingReceiptMsg(waChatId, waMsgId string) int64 {
+	pendingReceiptMsgsLock.Lock()
+	defer pendingReceiptMsgsLock.Unlock()
+
+	waKey := fmt.Sprintf("%s:%s", waChatId, waMsgId)
+	return receiptMsgByWaMsg[waKey]
+}
+
+func TgClearPendingReceiptMsgsForThread(b *gotgbot.Bot, chatId, threadId int64) {
+	pendingReceiptMsgsLock.Lock()
+	threadKey := fmt.Sprintf("%d:%d", chatId, threadId)
+	msgIds := pendingReceiptMsgsByThread[threadKey]
+	delete(pendingReceiptMsgsByThread, threadKey)
+	pendingReceiptMsgsLock.Unlock()
+
+	if len(msgIds) == 0 || b == nil {
+		return
+	}
+
+	go func(cId int64, ids []int64) {
+		for _, id := range ids {
+			b.DeleteMessage(cId, id, &gotgbot.DeleteMessageOpts{})
+		}
+	}(chatId, msgIds)
+}
+

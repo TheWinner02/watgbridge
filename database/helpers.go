@@ -181,13 +181,12 @@ func MsgReceiptUpsert(waMsgId, waChatId, participantId string, receiptType types
 	db := state.State.Database
 
 	var receipt MessageReceipt
-	res := db.Where("wa_msg_id = ? AND participant_id = ?", waMsgId, participantId).Find(&receipt)
+	res := db.Where("wa_msg_id = ? AND participant_id = ? AND receipt_type = ?", waMsgId, participantId, string(receiptType)).Find(&receipt)
 	if res.Error != nil {
 		return res.Error
 	}
 
-	if receipt.WaMsgId == waMsgId && receipt.ParticipantId == participantId {
-		receipt.ReceiptType = string(receiptType)
+	if receipt.WaMsgId == waMsgId && receipt.ParticipantId == participantId && receipt.ReceiptType == string(receiptType) {
 		receipt.ReceiptTime = receiptTime
 		if receipt.WaChatId == "" {
 			receipt.WaChatId = waChatId

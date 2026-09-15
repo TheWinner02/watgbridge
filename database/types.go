@@ -45,9 +45,9 @@ type ChatEphemeralSettings struct {
 
 type MessageReceipt struct {
 	WaMsgId       string    `gorm:"primaryKey;index:idx_receipt_msg_chat_participant"`
-	WaChatId      string    `gorm:"primaryKey;index:idx_receipt_msg_chat_participant"`
+	WaChatId      string    `gorm:"index:idx_receipt_msg_chat_participant"`
 	ParticipantId string    `gorm:"primaryKey;index:idx_receipt_msg_chat_participant"`
-	ReceiptType   string
+	ReceiptType   string    `gorm:"primaryKey"`
 	ReceiptTime   time.Time
 }
 

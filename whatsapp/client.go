@@ -3,6 +3,7 @@ package whatsapp
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"html"
 	"os"
@@ -54,6 +55,130 @@ const (
 	clientModeAndroidBusiness = "android_business"
 )
 
+// sendQRCodeToOwner sends the WhatsApp pairing QR code to the owner's Telegram
+// chat as a photo. If the code cannot be rendered as PNG, a text message is sent
+// instead so the operator still learns to look at the terminal.
+//
+// The QR code is always printed locally as well, so a failed Telegram request
+// must not abort the login flow: it is returned for the caller to log.
+func sendQRCodeToOwner(bot *gotgbot.Bot, ownerID int64, qrCode string) error {
+	qrCodePNG, err := qrcode.Encode(qrCode, qrcode.Highest, 512)
+	if err != nil {
+		_, sendErr := bot.SendMessage(
+			ownerID,
+			fmt.Sprintf(
+				"Please check your terminal and scan the QR code to login to WhatsApp. Failed to encode to PNG and send here:\n<code>%s</code>",
+				html.EscapeString(err.Error()),
+			),
+			&gotgbot.SendMessageOpts{},
+		)
+		if sendErr != nil {
+			return fmt.Errorf("could not encode the QR code as PNG (%v) and failed to send the fallback message : %w", err, sendErr)
+		}
+		return nil
+	}
+
+	_, err = bot.SendPhoto(
+		ownerID,
+		gotgbot.InputFileByReader("qrcode.png", bytes.NewReader(qrCodePNG)),
+		&gotgbot.SendPhotoOpts{
+			Caption: "Scan the above QR code to login to WhatsApp.",
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("failed to send the QR code photo : %w", err)
+	}
+
+	return nil
+}
+
+// maxQRPairingAttempts is how many full QR code rounds are offered before the
+// bridge gives up. One round lasts about 160 seconds (a 60 second code plus
+// five 20 second codes), so the operator gets about 8 minutes to scan.
+const maxQRPairingAttempts = 3
+
+// notifyOwner sends an HTML message to the owner's Telegram chat, if the bot
+// is available. Failures are only logged, because the caller is already on an
+// error or recovery path.
+func notifyOwner(logger *zap.Logger, text string) {
+	bot := state.State.TelegramBot
+	if bot == nil {
+		return
+	}
+	ownerID := state.State.Config.Telegram.OwnerID
+	if _, err := bot.SendMessage(ownerID, text, &gotgbot.SendMessageOpts{ParseMode: "HTML"}); err != nil {
+		logger.Error("failed to send a message to the owner on telegram",
+			zap.Int64("owner_id", ownerID),
+			zap.Error(err),
+		)
+	}
+}
+
+// pairWithQRCode links the client as a new device. When all the QR codes of a
+// round expire, it starts a new round, up to maxQRPairingAttempts rounds, so
+// the operator does not have to restart the bridge after one missed scan. Any
+// other failure (rejected pairing, outdated client, ...) is returned at once.
+func pairWithQRCode(client *whatsmeow.Client, logger *zap.Logger) error {
+	for attempt := 1; attempt <= maxQRPairingAttempts; attempt++ {
+		qrChan, err := client.GetQRChannel(context.Background())
+		if err != nil {
+			return fmt.Errorf("could not get the QR channel for Whatsapp login : %w", err)
+		}
+
+		markBacklogCutoff()
+		if err := client.Connect(); err != nil {
+			return fmt.Errorf("could not connect to Whatsapp for login : %w", err)
+		}
+
+		var lastEvt whatsmeow.QRChannelItem
+		for evt := range qrChan {
+			lastEvt = evt
+			if evt.Event == whatsmeow.QRChannelEventCode {
+				if state.State.TelegramBot != nil {
+					ownerID := state.State.Config.Telegram.OwnerID
+					if err := sendQRCodeToOwner(state.State.TelegramBot, ownerID, evt.Code); err != nil {
+						logger.Error("failed to send the QR code on telegram, scan the one printed in the terminal instead",
+							zap.Int64("owner_id", ownerID),
+							zap.Error(err),
+						)
+					}
+				}
+				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
+			} else {
+				logger.Info("received WhatsApp login event",
+					zap.Any("event", evt.Event),
+				)
+			}
+		}
+
+		switch {
+		case lastEvt.Event == whatsmeow.QRChannelSuccess.Event && client.Store.ID != nil:
+			return nil
+		case lastEvt.Event == whatsmeow.QRChannelTimeout.Event:
+			// whatsmeow already disconnected the client; it is safe to ask
+			// for a new QR channel in the next round.
+			client.Disconnect()
+			if attempt < maxQRPairingAttempts {
+				logger.Warn("the WhatsApp QR codes expired, sending new ones",
+					zap.Int("attempt", attempt+1),
+					zap.Int("max_attempts", maxQRPairingAttempts),
+				)
+				notifyOwner(logger, fmt.Sprintf(
+					"The QR codes expired. New QR codes follow (round %d of %d).",
+					attempt+1, maxQRPairingAttempts,
+				))
+			}
+		case lastEvt.Error != nil:
+			client.Disconnect()
+			return fmt.Errorf("whatsapp pairing failed (%s) : %w", lastEvt.Event, lastEvt.Error)
+		default:
+			client.Disconnect()
+			return fmt.Errorf("whatsapp pairing failed with event %q", lastEvt.Event)
+		}
+	}
+
+	return fmt.Errorf("could not complete whatsapp login : the QR codes expired %d times without a scan", maxQRPairingAttempts)
+}
 
 func NewWhatsAppClient() error {
 
@@ -164,56 +289,23 @@ func NewWhatsAppClient() error {
 	state.State.WhatsAppClient = client
 
 	if client.Store.ID == nil {
-		qrChan, _ := client.GetQRChannel(context.Background())
-		err = client.Connect()
-		if err != nil {
-			return fmt.Errorf("could not connect to Whatsapp for login : %s", err)
-		}
-		for evt := range qrChan {
-			if evt.Event == "code" {
-				// var png []byte
-				// png, _err := qrcode.Encode("aklsdfjasdfaklsdfjlasdfjaskldfjasldfjaklsdfjals", qrcode.Highest, 256)
-				// if _err != nil {
-				// 	panic(_err)
-				// }
-
-				if state.State.TelegramBot != nil {
-					qrCodePNG, err := qrcode.Encode(evt.Code, qrcode.Highest, 512)
-					if err != nil {
-						state.State.TelegramBot.SendMessage(
-							state.State.Config.Telegram.OwnerID,
-							fmt.Sprintf(
-								"Please check your terminal and scan the QR code to login to WhatsApp. Failed to encode to PNG and send here:\n<code>%s</code>",
-								html.EscapeString(err.Error()),
-							),
-							&gotgbot.SendMessageOpts{},
-						)
-					} else {
-						state.State.TelegramBot.SendPhoto(
-							state.State.Config.Telegram.OwnerID,
-							gotgbot.InputFileByReader("qrcode.png", bytes.NewReader(qrCodePNG)),
-							&gotgbot.SendPhotoOpts{
-								Caption: "Scan the above QR code to login to WhatsApp.",
-							},
-						)
-					}
-				}
-				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
-			} else {
-				logger.Info("received WhatsApp login event",
-					zap.Any("event", evt.Event),
-				)
-			}
+		if err := pairWithQRCode(client, logger); err != nil {
+			notifyOwner(logger, "WhatsApp pairing did not complete, so the bridge stops now.\n"+
+				"Restart the bridge to get a new QR code.\n\n<code>"+html.EscapeString(err.Error())+"</code>")
+			return err
 		}
 	} else {
+		markBacklogCutoff()
 		err = client.Connect()
 		if err != nil {
 			return fmt.Errorf("could not connect to Whatsapp : %s", err)
 		}
 	}
 
+	// Defensive: pairWithQRCode only returns nil after a successful pairing,
+	// but never dereference a nil device ID in the log line below.
 	if client.Store.ID == nil {
-		return fmt.Errorf("failed to login to WhatsApp: connection closed without pairing")
+		return errors.New("could not complete whatsapp login : no device ID after pairing")
 	}
 
 	logger.Info("successfully logged into WhatsApp",

@@ -33,3 +33,7 @@ docker-compose.yml
 # Nix
 /result
 .direnv/
+
+# IDE
+.idea/
+

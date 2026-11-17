@@ -98,6 +98,14 @@ func AddTelegramHandlers() {
 			"Restart the WhatsApp client",
 		},
 		waTgBridgeCommand{
+			handlers.NewCommand("restartbot", RestartBotHandler),
+			"Restart the whole bridge process (keeps the WhatsApp session)",
+		},
+		waTgBridgeCommand{
+			handlers.NewCommand("newqr", NewQRHandler),
+			"Log out of WhatsApp and send a new QR code to pair again",
+		},
+		waTgBridgeCommand{
 			handlers.NewCommand("joininvitelink", JoinInviteLinkHandler),
 			"Join a WhatsApp chat using invite link",
 		},
@@ -715,11 +723,9 @@ func UpdateAndRestartHandler(b *gotgbot.Bot, c *ext.Context) error {
 
 	}
 
-	os.Setenv("WATG_IS_RESTARTED", "1")
-	os.Setenv("WATG_CHAT_ID", fmt.Sprint(c.EffectiveChat.Id))
-	os.Setenv("WATG_MESSAGE_ID", fmt.Sprint(c.EffectiveMessage.MessageId))
-
-	err := syscall.Exec(path.Join(".", "watgbridge"), []string{}, os.Environ())
+	// The new binary was written to ./watgbridge, so run that one instead of
+	// the executable of the current process.
+	err := execBridge(c, path.Join(".", "watgbridge"))
 	if err != nil {
 		return utils.TgReplyWithErrorByContext(b, c, "Failed to run exec syscall to restart the bot", err)
 	}
@@ -779,6 +785,114 @@ func RestartWhatsAppConnectionHandler(b *gotgbot.Bot, c *ext.Context) error {
 
 	_, err = utils.TgReplyTextByContext(b, c, "Successfully restarted the WhatsApp connection", nil, false)
 	return err
+}
+
+// execBridge replaces the current process with binary. It keeps the original
+// command-line arguments (os.Args[1] can be a custom config path) and sets the
+// variables that make the new process reply "Successfully restarted" to the
+// command message. It returns only if the exec fails.
+func execBridge(c *ext.Context, binary string) error {
+	os.Setenv("WATG_IS_RESTARTED", "1")
+	os.Setenv("WATG_CHAT_ID", fmt.Sprint(c.EffectiveChat.Id))
+	os.Setenv("WATG_MESSAGE_ID", fmt.Sprint(c.EffectiveMessage.MessageId))
+
+	return syscall.Exec(binary, os.Args, os.Environ())
+}
+
+// currentExecutable returns the path of the running binary, so a restart works
+// when the bridge was not started from its own directory.
+func currentExecutable() string {
+	if exe, err := os.Executable(); err == nil {
+		return exe
+	}
+	return path.Join(".", "watgbridge")
+}
+
+// restartBridgeSoon re-executes the running binary in the background. The
+// short delay lets the updater acknowledge the current update first, so
+// Telegram does not deliver the same command to the new process again.
+// onFailure runs if the exec fails, so the caller can restore what it stopped.
+func restartBridgeSoon(b *gotgbot.Bot, c *ext.Context, onFailure func()) {
+	go func() {
+		time.Sleep(2 * time.Second)
+		err := execBridge(c, currentExecutable())
+		if onFailure != nil {
+			onFailure()
+		}
+		utils.TgReplyWithErrorByContext(b, c, "Failed to run exec syscall to restart the bot", err)
+	}()
+}
+
+func RestartBotHandler(b *gotgbot.Bot, c *ext.Context) error {
+	if !utils.TgUpdateIsAuthorized(b, c) {
+		return nil
+	}
+
+	utils.TgReplyTextByContext(b, c, "Restarting the bridge, the WhatsApp session is kept...", nil, false)
+
+	waClient := state.State.WhatsAppClient
+	if waClient != nil {
+		waClient.Disconnect()
+	}
+
+	restartBridgeSoon(b, c, func() {
+		// The process keeps running, so bring the WhatsApp connection back.
+		if waClient == nil {
+			return
+		}
+		if err := waClient.Connect(); err != nil {
+			utils.TgReplyWithErrorByContext(b, c, "Failed to reconnect to WA servers, use /restartwa", err)
+		}
+	})
+	return nil
+}
+
+// NewQRHandler removes the current WhatsApp session and restarts the bridge,
+// which then sends a fresh pairing QR code to the owner. Only the device row
+// is removed; the chat/thread mappings in the bot database are not touched.
+func NewQRHandler(b *gotgbot.Bot, c *ext.Context) error {
+	if !utils.TgUpdateIsAuthorized(b, c) {
+		return nil
+	}
+
+	waClient := state.State.WhatsAppClient
+	if waClient == nil || waClient.Store == nil {
+		_, err := utils.TgReplyTextByContext(b, c, "WhatsApp client is not initialised", nil, false)
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	if waClient.Store.ID != nil {
+		// Logout also deletes the device from the store on success. It fails
+		// when WhatsApp has already dropped the session, so delete it locally.
+		if err := waClient.Logout(ctx); err != nil {
+			utils.TgReplyTextByContext(b, c,
+				"Could not log out on WhatsApp's side (the session is probably already invalid), removing it locally", nil, false)
+			if err := waClient.Store.Delete(ctx); err != nil {
+				return utils.TgReplyWithErrorByContext(b, c, "Failed to delete the local WhatsApp session", err)
+			}
+		}
+	}
+	waClient.Disconnect()
+
+	// The pairing flow always sends the QR code to the owner's private chat.
+	qrDestination := "here"
+	if c.EffectiveChat.Id != state.State.Config.Telegram.OwnerID {
+		qrDestination = "to the bot owner's private chat"
+	}
+
+	utils.TgReplyTextByContext(b, c,
+		"Session removed. Restarting now, a new QR code will be sent "+qrDestination+" in a few seconds.\n"+
+			"On your phone: WhatsApp &gt; Linked devices &gt; Link a device.", nil, false)
+
+	restartBridgeSoon(b, c, func() {
+		// The session is already gone, so only a manual restart can pair again.
+		utils.TgReplyTextByContext(b, c,
+			"The WhatsApp session was removed but the bridge could not restart. Restart it manually to get a new QR code.", nil, false)
+	})
+	return nil
 }
 
 func JoinInviteLinkHandler(b *gotgbot.Bot, c *ext.Context) error {
@@ -930,7 +1044,7 @@ func handleBlockUnblockUser(b *gotgbot.Bot, c *ext.Context, action events.Blockl
 		return err
 	}
 	jid, _ := utils.WaParseJID(waChatId)
-	_, err = state.State.WhatsAppClient.UpdateBlocklist(context.Background(), jid, action)
+	_, err = state.State.WhatsAppClient.UpdateBlocklist(context.Background(), jid, action, "")
 	if err != nil {
 		err = utils.TgReplyWithErrorByContext(b, c, "Failed to change the blocklist status", err)
 		return err
@@ -1213,7 +1327,8 @@ func RevokeCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 	if len(data) == 3 {
 
 		confirmKeyboard := utils.TgMakeRevokeKeyboard(data[1], data[2], true)
-		_, _, err := b.EditMessageText("Revoke the message ?", &gotgbot.EditMessageTextOpts{
+		_, _, err := b.EditMessageText(&gotgbot.EditMessageTextOpts{
+			Text:        "Revoke the message ?",
 			ChatId:      c.EffectiveChat.Id,
 			MessageId:   c.EffectiveMessage.MessageId,
 			ReplyMarkup: *confirmKeyboard,
@@ -1230,7 +1345,8 @@ func RevokeCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 		if confirmation == "n" {
 
 			revokeKeyboard := utils.TgMakeRevokeKeyboard(data[1], data[2], false)
-			_, _, err := b.EditMessageText("Successfully sent", &gotgbot.EditMessageTextOpts{
+			_, _, err := b.EditMessageText(&gotgbot.EditMessageTextOpts{
+				Text:        "Successfully sent",
 				ChatId:      c.EffectiveChat.Id,
 				MessageId:   c.EffectiveMessage.MessageId,
 				ReplyMarkup: *revokeKeyboard,
@@ -1259,7 +1375,8 @@ func RevokeCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 					ShowAlert: true,
 					CacheTime: 60,
 				})
-				b.EditMessageText("<i>Revoked</i>", &gotgbot.EditMessageTextOpts{
+				b.EditMessageText(&gotgbot.EditMessageTextOpts{
+					Text:      "<i>Revoked</i>",
 					ChatId:    c.EffectiveChat.Id,
 					MessageId: c.EffectiveMessage.MessageId,
 					ReplyMarkup: gotgbot.InlineKeyboardMarkup{
@@ -1446,7 +1563,8 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 			CallbackData: "menu_chats",
 		}})
 
-		_, _, err = b.EditMessageText(fmt.Sprintf("<b>Link to WhatsApp Chat</b> (Page %d/%d)\n\nSelect a group chat to link with the current thread:", page+1, (len(waGroups)+itemsPerPage-1)/itemsPerPage), &gotgbot.EditMessageTextOpts{
+		_, _, err = b.EditMessageText(&gotgbot.EditMessageTextOpts{
+			Text:        fmt.Sprintf("<b>Link to WhatsApp Chat</b> (Page %d/%d)\n\nSelect a group chat to link with the current thread:", page+1, (len(waGroups)+itemsPerPage-1)/itemsPerPage),
 			ChatId:      c.EffectiveChat.Id,
 			MessageId:   c.EffectiveMessage.MessageId,
 			ReplyMarkup: gotgbot.InlineKeyboardMarkup{InlineKeyboard: buttons},
@@ -1541,7 +1659,8 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 			CallbackData: "menu_main",
 		}})
 
-		_, _, err = b.EditMessageText(outputString, &gotgbot.EditMessageTextOpts{
+		_, _, err = b.EditMessageText(&gotgbot.EditMessageTextOpts{
+			Text:        outputString,
 			ChatId:      c.EffectiveChat.Id,
 			MessageId:   c.EffectiveMessage.MessageId,
 			ReplyMarkup: gotgbot.InlineKeyboardMarkup{InlineKeyboard: buttons},
@@ -1638,7 +1757,8 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 			CallbackData: "menu_chats",
 		}})
 
-		_, _, err = b.EditMessageText(outputString, &gotgbot.EditMessageTextOpts{
+		_, _, err = b.EditMessageText(&gotgbot.EditMessageTextOpts{
+			Text:        outputString,
 			ChatId:      c.EffectiveChat.Id,
 			MessageId:   c.EffectiveMessage.MessageId,
 			ReplyMarkup: gotgbot.InlineKeyboardMarkup{InlineKeyboard: buttons},
@@ -1651,7 +1771,8 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 		switch data {
 		case "menu_main":
 			keyboard := TgMakeMenuKeyboard()
-			_, _, err := b.EditMessageText("<b>WaTgBridge Control Panel</b>\n\nChoose an action from the options below:", &gotgbot.EditMessageTextOpts{
+			_, _, err := b.EditMessageText(&gotgbot.EditMessageTextOpts{
+				Text:        "<b>WaTgBridge Control Panel</b>\n\nChoose an action from the options below:",
 				ChatId:      c.EffectiveChat.Id,
 				MessageId:   c.EffectiveMessage.MessageId,
 				ReplyMarkup: *keyboard,
@@ -1716,7 +1837,8 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 				},
 			}
 
-			_, _, err := b.EditMessageText(statusText, &gotgbot.EditMessageTextOpts{
+			_, _, err := b.EditMessageText(&gotgbot.EditMessageTextOpts{
+				Text:        statusText,
 				ChatId:      c.EffectiveChat.Id,
 				MessageId:   c.EffectiveMessage.MessageId,
 				ReplyMarkup: *statusKeyboard,
@@ -1746,7 +1868,8 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 				}}},
 			}
 
-			_, _, err = b.EditMessageText("🔄 <b>Contacts synchronization started in background...</b>", &gotgbot.EditMessageTextOpts{
+			_, _, err = b.EditMessageText(&gotgbot.EditMessageTextOpts{
+				Text:        "🔄 <b>Contacts synchronization started in background...</b>",
 				ChatId:      c.EffectiveChat.Id,
 				MessageId:   c.EffectiveMessage.MessageId,
 				ReplyMarkup: *backKeyboard,
@@ -1834,7 +1957,8 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 				}
 			}
 
-			_, _, err = b.EditMessageText(text, &gotgbot.EditMessageTextOpts{
+			_, _, err = b.EditMessageText(&gotgbot.EditMessageTextOpts{
+				Text:        text,
 				ChatId:      c.EffectiveChat.Id,
 				MessageId:   c.EffectiveMessage.MessageId,
 				ReplyMarkup: *keyboard,
@@ -1877,7 +2001,8 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 					},
 				},
 			}
-			_, _, err := b.EditMessageText("<b>Tools & Utilities</b>\n\nGeneral options and tools for managing the bridge:", &gotgbot.EditMessageTextOpts{
+			_, _, err := b.EditMessageText(&gotgbot.EditMessageTextOpts{
+				Text:        "<b>Tools & Utilities</b>\n\nGeneral options and tools for managing the bridge:",
 				ChatId:      c.EffectiveChat.Id,
 				MessageId:   c.EffectiveMessage.MessageId,
 				ReplyMarkup: *keyboard,
@@ -1900,7 +2025,8 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 				},
 			}
 
-			_, _, err := b.EditMessageText("<b>Are you sure you want to restart the WhatsApp connection?</b>", &gotgbot.EditMessageTextOpts{
+			_, _, err := b.EditMessageText(&gotgbot.EditMessageTextOpts{
+				Text:        "<b>Are you sure you want to restart the WhatsApp connection?</b>",
 				ChatId:      c.EffectiveChat.Id,
 				MessageId:   c.EffectiveMessage.MessageId,
 				ReplyMarkup: *confirmKeyboard,
@@ -1928,7 +2054,8 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 				}}},
 			}
 
-			_, _, err = b.EditMessageText(statusText, &gotgbot.EditMessageTextOpts{
+			_, _, err = b.EditMessageText(&gotgbot.EditMessageTextOpts{
+				Text:        statusText,
 				ChatId:      c.EffectiveChat.Id,
 				MessageId:   c.EffectiveMessage.MessageId,
 				ReplyMarkup: *backKeyboard,
@@ -1939,7 +2066,8 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 
 		case "menu_sync_topics":
 			cq.Answer(b, &gotgbot.AnswerCallbackQueryOpts{Text: "Syncing topic names..."})
-			b.EditMessageText("🔄 <b>Syncing topic names...</b>", &gotgbot.EditMessageTextOpts{
+			b.EditMessageText(&gotgbot.EditMessageTextOpts{
+				Text:      "🔄 <b>Syncing topic names...</b>",
 				ChatId:    c.EffectiveChat.Id,
 				MessageId: c.EffectiveMessage.MessageId,
 				ParseMode: "HTML",
@@ -1960,7 +2088,8 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 				}}},
 			}
 
-			b.EditMessageText(statusText, &gotgbot.EditMessageTextOpts{
+			b.EditMessageText(&gotgbot.EditMessageTextOpts{
+				Text:        statusText,
 				ChatId:      c.EffectiveChat.Id,
 				MessageId:   c.EffectiveMessage.MessageId,
 				ReplyMarkup: *backKeyboard,
@@ -1982,7 +2111,8 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 				},
 			}
 
-			_, _, err := b.EditMessageText("<b>Are you sure you want to clear message pairs history?</b>\n<i>This will unlink replies of older bridged messages.</i>", &gotgbot.EditMessageTextOpts{
+			_, _, err := b.EditMessageText(&gotgbot.EditMessageTextOpts{
+				Text:        "<b>Are you sure you want to clear message pairs history?</b>\n<i>This will unlink replies of older bridged messages.</i>",
 				ChatId:      c.EffectiveChat.Id,
 				MessageId:   c.EffectiveMessage.MessageId,
 				ReplyMarkup: *confirmKeyboard,
@@ -1993,7 +2123,8 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 
 		case "menu_clearpair_action":
 			cq.Answer(b, &gotgbot.AnswerCallbackQueryOpts{Text: "Clearing history..."})
-			b.EditMessageText("🗑️ <b>Clearing stored message pairs...</b>", &gotgbot.EditMessageTextOpts{
+			b.EditMessageText(&gotgbot.EditMessageTextOpts{
+				Text:      "🗑️ <b>Clearing stored message pairs...</b>",
 				ChatId:    c.EffectiveChat.Id,
 				MessageId: c.EffectiveMessage.MessageId,
 				ParseMode: "HTML",
@@ -2014,7 +2145,8 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 				}}},
 			}
 
-			b.EditMessageText(statusText, &gotgbot.EditMessageTextOpts{
+			b.EditMessageText(&gotgbot.EditMessageTextOpts{
+				Text:        statusText,
 				ChatId:      c.EffectiveChat.Id,
 				MessageId:   c.EffectiveMessage.MessageId,
 				ReplyMarkup: *backKeyboard,
@@ -2036,7 +2168,8 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 				},
 			}
 
-			_, _, err := b.EditMessageText("<b>Are you sure you want to update the bot from GitHub and restart?</b>", &gotgbot.EditMessageTextOpts{
+			_, _, err := b.EditMessageText(&gotgbot.EditMessageTextOpts{
+				Text:        "<b>Are you sure you want to update the bot from GitHub and restart?</b>",
 				ChatId:      c.EffectiveChat.Id,
 				MessageId:   c.EffectiveMessage.MessageId,
 				ReplyMarkup: *confirmKeyboard,
@@ -2047,7 +2180,8 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 
 		case "menu_update_action":
 			cq.Answer(b, &gotgbot.AnswerCallbackQueryOpts{Text: "Updating..."})
-			b.EditMessageText("🔄 <b>Checking for updates and rebuilding...</b>", &gotgbot.EditMessageTextOpts{
+			b.EditMessageText(&gotgbot.EditMessageTextOpts{
+				Text:      "🔄 <b>Checking for updates and rebuilding...</b>",
 				ChatId:    c.EffectiveChat.Id,
 				MessageId: c.EffectiveMessage.MessageId,
 				ParseMode: "HTML",
@@ -2056,7 +2190,8 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 
 		case "menu_trigger_backup":
 			cq.Answer(b, &gotgbot.AnswerCallbackQueryOpts{Text: "Generating backup..."})
-			b.EditMessageText("💾 <b>Generating database backup archive...</b>", &gotgbot.EditMessageTextOpts{
+			b.EditMessageText(&gotgbot.EditMessageTextOpts{
+				Text:      "💾 <b>Generating database backup archive...</b>",
 				ChatId:    c.EffectiveChat.Id,
 				MessageId: c.EffectiveMessage.MessageId,
 				ParseMode: "HTML",
@@ -2076,7 +2211,8 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 				}}},
 			}
 
-			b.EditMessageText(statusText, &gotgbot.EditMessageTextOpts{
+			b.EditMessageText(&gotgbot.EditMessageTextOpts{
+				Text:        statusText,
 				ChatId:      c.EffectiveChat.Id,
 				MessageId:   c.EffectiveMessage.MessageId,
 				ReplyMarkup: *backKeyboard,
@@ -2091,7 +2227,8 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 					CallbackData: "menu_tools",
 				}}},
 			}
-			_, _, err := b.EditMessageText("<b>📝 Set WhatsApp Status Message</b>\n\nTo update your WhatsApp profile 'About / Bio' status text, send:\n\n<code>/setstatusmessage &lt;new status text&gt;</code>\n\n<i>Example: /setstatusmessage Available on Telegram</i>", &gotgbot.EditMessageTextOpts{
+			_, _, err := b.EditMessageText(&gotgbot.EditMessageTextOpts{
+				Text:        "<b>📝 Set WhatsApp Status Message</b>\n\nTo update your WhatsApp profile 'About / Bio' status text, send:\n\n<code>/setstatusmessage &lt;new status text&gt;</code>\n\n<i>Example: /setstatusmessage Available on Telegram</i>",
 				ChatId:      c.EffectiveChat.Id,
 				MessageId:   c.EffectiveMessage.MessageId,
 				ReplyMarkup: *backKeyboard,
@@ -2107,7 +2244,8 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 					CallbackData: "menu_chats",
 				}}},
 			}
-			_, _, err := b.EditMessageText("<b>📌 Link Group Chat</b>\n\nTo link the current Telegram topic to a WhatsApp group chat, send this command in this topic:\n\n<code>/settargetgroupchat &lt;whatsapp_group_jid&gt;</code>\n\n<i>Example: /settargetgroupchat 120363042@g.us</i>", &gotgbot.EditMessageTextOpts{
+			_, _, err := b.EditMessageText(&gotgbot.EditMessageTextOpts{
+				Text:        "<b>📌 Link Group Chat</b>\n\nTo link the current Telegram topic to a WhatsApp group chat, send this command in this topic:\n\n<code>/settargetgroupchat &lt;whatsapp_group_jid&gt;</code>\n\n<i>Example: /settargetgroupchat 120363042@g.us</i>",
 				ChatId:      c.EffectiveChat.Id,
 				MessageId:   c.EffectiveMessage.MessageId,
 				ReplyMarkup: *backKeyboard,
@@ -2123,7 +2261,8 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 					CallbackData: "menu_chats",
 				}}},
 			}
-			_, _, err := b.EditMessageText("<b>👤 Link Private Chat</b>\n\nTo link the current Telegram topic to a WhatsApp private chat, send this command in this topic:\n\n<code>/settargetprivatechat &lt;whatsapp_user_jid&gt;</code>\n\n<i>Example: /settargetprivatechat 393664019966@s.whatsapp.net</i>", &gotgbot.EditMessageTextOpts{
+			_, _, err := b.EditMessageText(&gotgbot.EditMessageTextOpts{
+				Text:        "<b>👤 Link Private Chat</b>\n\nTo link the current Telegram topic to a WhatsApp private chat, send this command in this topic:\n\n<code>/settargetprivatechat &lt;whatsapp_user_jid&gt;</code>\n\n<i>Example: /settargetprivatechat 393664019966@s.whatsapp.net</i>",
 				ChatId:      c.EffectiveChat.Id,
 				MessageId:   c.EffectiveMessage.MessageId,
 				ReplyMarkup: *backKeyboard,
@@ -2139,7 +2278,8 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 					CallbackData: "menu_chats",
 				}}},
 			}
-			_, _, err := b.EditMessageText("<b>🔗 Unlink Thread</b>\n\nTo unlink the current Telegram topic from its WhatsApp chat, send this command in this topic:\n\n<code>/unlinkthread</code>", &gotgbot.EditMessageTextOpts{
+			_, _, err := b.EditMessageText(&gotgbot.EditMessageTextOpts{
+				Text:        "<b>🔗 Unlink Thread</b>\n\nTo unlink the current Telegram topic from its WhatsApp chat, send this command in this topic:\n\n<code>/unlinkthread</code>",
 				ChatId:      c.EffectiveChat.Id,
 				MessageId:   c.EffectiveMessage.MessageId,
 				ReplyMarkup: *backKeyboard,
@@ -2155,7 +2295,8 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 					CallbackData: "menu_tools",
 				}}},
 			}
-			_, _, err := b.EditMessageText("<b>🔍 Find Contact JID</b>\n\nTo search for a contact JID by name, send:\n\n<code>/findcontact &lt;name&gt;</code>\n\n<i>Example: /findcontact John</i>", &gotgbot.EditMessageTextOpts{
+			_, _, err := b.EditMessageText(&gotgbot.EditMessageTextOpts{
+				Text:        "<b>🔍 Find Contact JID</b>\n\nTo search for a contact JID by name, send:\n\n<code>/findcontact &lt;name&gt;</code>\n\n<i>Example: /findcontact John</i>",
 				ChatId:      c.EffectiveChat.Id,
 				MessageId:   c.EffectiveMessage.MessageId,
 				ReplyMarkup: *backKeyboard,
@@ -2171,7 +2312,8 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 					CallbackData: "menu_tools",
 				}}},
 			}
-			_, _, err := b.EditMessageText("<b>🔗 Join via WhatsApp Invite Link</b>\n\nTo join a WhatsApp group using an invite link, send:\n\n<code>/joininvitelink &lt;invite_link&gt;</code>\n\n<i>Example: /joininvitelink https://chat.whatsapp.com/AbCdEfGh...</i>", &gotgbot.EditMessageTextOpts{
+			_, _, err := b.EditMessageText(&gotgbot.EditMessageTextOpts{
+				Text:        "<b>🔗 Join via WhatsApp Invite Link</b>\n\nTo join a WhatsApp group using an invite link, send:\n\n<code>/joininvitelink &lt;invite_link&gt;</code>\n\n<i>Example: /joininvitelink https://chat.whatsapp.com/AbCdEfGh...</i>",
 				ChatId:      c.EffectiveChat.Id,
 				MessageId:   c.EffectiveMessage.MessageId,
 				ReplyMarkup: *backKeyboard,
@@ -2191,7 +2333,8 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 			waChatID, err := database.ChatThreadGetWaFromTg(c.EffectiveChat.Id, c.EffectiveMessage.MessageThreadId)
 			if err == nil && waChatID != "" {
 				cq.Answer(b, &gotgbot.AnswerCallbackQueryOpts{Text: "Fetching profile picture..."})
-				b.EditMessageText("🖼️ <b>Fetching profile picture...</b>", &gotgbot.EditMessageTextOpts{
+				b.EditMessageText(&gotgbot.EditMessageTextOpts{
+					Text:      "🖼️ <b>Fetching profile picture...</b>",
 					ChatId:    c.EffectiveChat.Id,
 					MessageId: c.EffectiveMessage.MessageId,
 					ParseMode: "HTML",
@@ -2203,7 +2346,8 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 				ppInfo, err := waClient.GetProfilePictureInfo(context.Background(), userJID, &whatsmeow.GetProfilePictureParams{})
 				if err != nil {
 					backKeyboard := &gotgbot.InlineKeyboardMarkup{InlineKeyboard: [][]gotgbot.InlineKeyboardButton{{{Text: "🔙 Back", CallbackData: returnTarget}}}}
-					_, _, _ = b.EditMessageText("❌ <b>Failed to fetch profile picture info from WhatsApp:</b>\n"+html.EscapeString(err.Error()), &gotgbot.EditMessageTextOpts{
+					_, _, _ = b.EditMessageText(&gotgbot.EditMessageTextOpts{
+						Text:        "❌ <b>Failed to fetch profile picture info from WhatsApp:</b>\n" + html.EscapeString(err.Error()),
 						ChatId:      c.EffectiveChat.Id,
 						MessageId:   c.EffectiveMessage.MessageId,
 						ReplyMarkup: *backKeyboard,
@@ -2215,7 +2359,8 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 				res, err := http.DefaultClient.Get(ppInfo.URL)
 				if err != nil {
 					backKeyboard := &gotgbot.InlineKeyboardMarkup{InlineKeyboard: [][]gotgbot.InlineKeyboardButton{{{Text: "🔙 Back", CallbackData: returnTarget}}}}
-					_, _, _ = b.EditMessageText("❌ <b>Failed to download photo:</b>\n"+html.EscapeString(err.Error()), &gotgbot.EditMessageTextOpts{
+					_, _, _ = b.EditMessageText(&gotgbot.EditMessageTextOpts{
+						Text:        "❌ <b>Failed to download photo:</b>\n" + html.EscapeString(err.Error()),
 						ChatId:      c.EffectiveChat.Id,
 						MessageId:   c.EffectiveMessage.MessageId,
 						ReplyMarkup: *backKeyboard,
@@ -2244,7 +2389,8 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 					CallbackData: returnTarget,
 				}}},
 			}
-			_, _, err = b.EditMessageText("<b>🖼️ Get Profile Picture</b>\n\nTo fetch the profile picture of a JID, send:\n\n<code>/getprofilepicture &lt;jid&gt;</code>\n\n<i>Example: /getprofilepicture 120363042@g.us</i>", &gotgbot.EditMessageTextOpts{
+			_, _, err = b.EditMessageText(&gotgbot.EditMessageTextOpts{
+				Text:        "<b>🖼️ Get Profile Picture</b>\n\nTo fetch the profile picture of a JID, send:\n\n<code>/getprofilepicture &lt;jid&gt;</code>\n\n<i>Example: /getprofilepicture 120363042@g.us</i>",
 				ChatId:      c.EffectiveChat.Id,
 				MessageId:   c.EffectiveMessage.MessageId,
 				ReplyMarkup: *backKeyboard,
@@ -2259,7 +2405,8 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 				waChatJID, _ := utils.WaParseJID(waChatID)
 				if waChatJID.Server == waTypes.GroupServer {
 					backKeyboard := &gotgbot.InlineKeyboardMarkup{InlineKeyboard: [][]gotgbot.InlineKeyboardButton{{{Text: "🔙 Back", CallbackData: "menu_tools"}}}}
-					_, _, err = b.EditMessageText("⚠️ <b>Block user is not applicable:</b>\nThis thread is linked to a WhatsApp Group. Only users can be blocked.", &gotgbot.EditMessageTextOpts{
+					_, _, err = b.EditMessageText(&gotgbot.EditMessageTextOpts{
+						Text:        "⚠️ <b>Block user is not applicable:</b>\nThis thread is linked to a WhatsApp Group. Only users can be blocked.",
 						ChatId:      c.EffectiveChat.Id,
 						MessageId:   c.EffectiveMessage.MessageId,
 						ReplyMarkup: *backKeyboard,
@@ -2276,7 +2423,8 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 					},
 				}
 				chatName := utils.WaGetContactName(waChatJID)
-				_, _, err = b.EditMessageText(fmt.Sprintf("<b>Are you sure you want to block this user on WhatsApp?</b>\n\nName: <b>%s</b>\nJID: <code>%s</code>", html.EscapeString(chatName), html.EscapeString(waChatID)), &gotgbot.EditMessageTextOpts{
+				_, _, err = b.EditMessageText(&gotgbot.EditMessageTextOpts{
+					Text:        fmt.Sprintf("<b>Are you sure you want to block this user on WhatsApp?</b>\n\nName: <b>%s</b>\nJID: <code>%s</code>", html.EscapeString(chatName), html.EscapeString(waChatID)),
 					ChatId:      c.EffectiveChat.Id,
 					MessageId:   c.EffectiveMessage.MessageId,
 					ReplyMarkup: *confirmKeyboard,
@@ -2292,7 +2440,8 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 					CallbackData: "menu_tools",
 				}}},
 			}
-			_, _, err = b.EditMessageText("<b>🚫 Block User</b>\n\nTo block a WhatsApp user, send:\n\n<code>/block &lt;user_jid&gt;</code>\n\n<i>Example: /block 393664019966@s.whatsapp.net</i>", &gotgbot.EditMessageTextOpts{
+			_, _, err = b.EditMessageText(&gotgbot.EditMessageTextOpts{
+				Text:        "<b>🚫 Block User</b>\n\nTo block a WhatsApp user, send:\n\n<code>/block &lt;user_jid&gt;</code>\n\n<i>Example: /block 393664019966@s.whatsapp.net</i>",
 				ChatId:      c.EffectiveChat.Id,
 				MessageId:   c.EffectiveMessage.MessageId,
 				ReplyMarkup: *backKeyboard,
@@ -2307,7 +2456,8 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 				waChatJID, _ := utils.WaParseJID(waChatID)
 				if waChatJID.Server == waTypes.GroupServer {
 					backKeyboard := &gotgbot.InlineKeyboardMarkup{InlineKeyboard: [][]gotgbot.InlineKeyboardButton{{{Text: "🔙 Back", CallbackData: "menu_tools"}}}}
-					_, _, err = b.EditMessageText("⚠️ <b>Unblock user is not applicable:</b>\nThis thread is linked to a WhatsApp Group. Group chats cannot be blocked/unblocked.", &gotgbot.EditMessageTextOpts{
+					_, _, err = b.EditMessageText(&gotgbot.EditMessageTextOpts{
+						Text:        "⚠️ <b>Unblock user is not applicable:</b>\nThis thread is linked to a WhatsApp Group. Group chats cannot be blocked/unblocked.",
 						ChatId:      c.EffectiveChat.Id,
 						MessageId:   c.EffectiveMessage.MessageId,
 						ReplyMarkup: *backKeyboard,
@@ -2324,7 +2474,8 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 					},
 				}
 				chatName := utils.WaGetContactName(waChatJID)
-				_, _, err = b.EditMessageText(fmt.Sprintf("<b>Are you sure you want to unblock this user on WhatsApp?</b>\n\nName: <b>%s</b>\nJID: <code>%s</code>", html.EscapeString(chatName), html.EscapeString(waChatID)), &gotgbot.EditMessageTextOpts{
+				_, _, err = b.EditMessageText(&gotgbot.EditMessageTextOpts{
+					Text:        fmt.Sprintf("<b>Are you sure you want to unblock this user on WhatsApp?</b>\n\nName: <b>%s</b>\nJID: <code>%s</code>", html.EscapeString(chatName), html.EscapeString(waChatID)),
 					ChatId:      c.EffectiveChat.Id,
 					MessageId:   c.EffectiveMessage.MessageId,
 					ReplyMarkup: *confirmKeyboard,
@@ -2340,7 +2491,8 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 					CallbackData: "menu_tools",
 				}}},
 			}
-			_, _, err = b.EditMessageText("<b>🟢 Unblock User</b>\n\nTo unblock a WhatsApp user, send:\n\n<code>/unblock &lt;user_jid&gt;</code>\n\n<i>Example: /unblock 393664019966@s.whatsapp.net</i>", &gotgbot.EditMessageTextOpts{
+			_, _, err = b.EditMessageText(&gotgbot.EditMessageTextOpts{
+				Text:        "<b>🟢 Unblock User</b>\n\nTo unblock a WhatsApp user, send:\n\n<code>/unblock &lt;user_jid&gt;</code>\n\n<i>Example: /unblock 393664019966@s.whatsapp.net</i>",
 				ChatId:      c.EffectiveChat.Id,
 				MessageId:   c.EffectiveMessage.MessageId,
 				ReplyMarkup: *backKeyboard,
@@ -2356,10 +2508,11 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 				return err
 			}
 			jid, _ := utils.WaParseJID(waChatID)
-			_, err = state.State.WhatsAppClient.UpdateBlocklist(context.Background(), jid, events.BlocklistChangeActionBlock)
+			_, err = state.State.WhatsAppClient.UpdateBlocklist(context.Background(), jid, events.BlocklistChangeActionBlock, "")
 			if err != nil {
 				backKeyboard := &gotgbot.InlineKeyboardMarkup{InlineKeyboard: [][]gotgbot.InlineKeyboardButton{{{Text: "🔙 Back", CallbackData: "menu_tools"}}}}
-				_, _, _ = b.EditMessageText("❌ <b>Failed to block user:</b>\n"+html.EscapeString(err.Error()), &gotgbot.EditMessageTextOpts{
+				_, _, _ = b.EditMessageText(&gotgbot.EditMessageTextOpts{
+					Text:        "❌ <b>Failed to block user:</b>\n" + html.EscapeString(err.Error()),
 					ChatId:      c.EffectiveChat.Id,
 					MessageId:   c.EffectiveMessage.MessageId,
 					ReplyMarkup: *backKeyboard,
@@ -2378,10 +2531,11 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 				return err
 			}
 			jid, _ := utils.WaParseJID(waChatID)
-			_, err = state.State.WhatsAppClient.UpdateBlocklist(context.Background(), jid, events.BlocklistChangeActionUnblock)
+			_, err = state.State.WhatsAppClient.UpdateBlocklist(context.Background(), jid, events.BlocklistChangeActionUnblock, "")
 			if err != nil {
 				backKeyboard := &gotgbot.InlineKeyboardMarkup{InlineKeyboard: [][]gotgbot.InlineKeyboardButton{{{Text: "🔙 Back", CallbackData: "menu_tools"}}}}
-				_, _, _ = b.EditMessageText("❌ <b>Failed to unblock user:</b>\n"+html.EscapeString(err.Error()), &gotgbot.EditMessageTextOpts{
+				_, _, _ = b.EditMessageText(&gotgbot.EditMessageTextOpts{
+					Text:        "❌ <b>Failed to unblock user:</b>\n" + html.EscapeString(err.Error()),
 					ChatId:      c.EffectiveChat.Id,
 					MessageId:   c.EffectiveMessage.MessageId,
 					ReplyMarkup: *backKeyboard,
@@ -2408,7 +2562,8 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 				}}},
 			}
 
-			_, _, err := b.EditMessageText(helpText, &gotgbot.EditMessageTextOpts{
+			_, _, err := b.EditMessageText(&gotgbot.EditMessageTextOpts{
+				Text:        helpText,
 				ChatId:      c.EffectiveChat.Id,
 				MessageId:   c.EffectiveMessage.MessageId,
 				ReplyMarkup: *backKeyboard,
@@ -2479,7 +2634,8 @@ func AIChatHandler(b *gotgbot.Bot, c *ext.Context) error {
 
 	aiResponse, err := utils.CallGemini(cfg.Gemini.APIKey, finalPrompt)
 	if err != nil {
-		b.EditMessageText(fmt.Sprintf("❌ <b>Error calling Gemini:</b>\n%s", html.EscapeString(err.Error())), &gotgbot.EditMessageTextOpts{
+		b.EditMessageText(&gotgbot.EditMessageTextOpts{
+			Text:      fmt.Sprintf("❌ <b>Error calling Gemini:</b>\n%s", html.EscapeString(err.Error())),
 			ChatId:    c.EffectiveChat.Id,
 			MessageId: statusMsg.MessageId,
 			ParseMode: "HTML",
@@ -2517,7 +2673,8 @@ func AIChatHandler(b *gotgbot.Bot, c *ext.Context) error {
 			},
 		}
 
-		b.EditMessageText(fmt.Sprintf("🤖 <b>AI response ready:</b>\n\n%s\n\n<i>Send this message to WhatsApp?</i>", html.EscapeString(aiResponse)), &gotgbot.EditMessageTextOpts{
+		b.EditMessageText(&gotgbot.EditMessageTextOpts{
+			Text:        fmt.Sprintf("🤖 <b>AI response ready:</b>\n\n%s\n\n<i>Send this message to WhatsApp?</i>", html.EscapeString(aiResponse)),
 			ChatId:      c.EffectiveChat.Id,
 			MessageId:   statusMsg.MessageId,
 			ReplyMarkup: *confirmKeyboard,
@@ -2527,7 +2684,8 @@ func AIChatHandler(b *gotgbot.Bot, c *ext.Context) error {
 	}
 
 	// No WhatsApp chat linked — just show the response in Telegram
-	b.EditMessageText(fmt.Sprintf("🤖 <b>AI response:</b>\n\n%s", html.EscapeString(aiResponse)), &gotgbot.EditMessageTextOpts{
+	b.EditMessageText(&gotgbot.EditMessageTextOpts{
+		Text:      fmt.Sprintf("🤖 <b>AI response:</b>\n\n%s", html.EscapeString(aiResponse)),
 		ChatId:    c.EffectiveChat.Id,
 		MessageId: statusMsg.MessageId,
 		ParseMode: "HTML",
@@ -2557,7 +2715,8 @@ func AIPendingCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 	raw, exists := aiPendingStore.LoadAndDelete(pendingID)
 	if !exists {
 		cq.Answer(b, &gotgbot.AnswerCallbackQueryOpts{Text: "This response has already been handled or expired.", ShowAlert: true})
-		b.EditMessageText("⏳ <i>This response has already been handled or expired.</i>", &gotgbot.EditMessageTextOpts{
+		b.EditMessageText(&gotgbot.EditMessageTextOpts{
+			Text:      "⏳ <i>This response has already been handled or expired.</i>",
 			ChatId:    c.EffectiveChat.Id,
 			MessageId: c.EffectiveMessage.MessageId,
 			ParseMode: "HTML",
@@ -2569,7 +2728,8 @@ func AIPendingCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 
 	if action == "discard" {
 		cq.Answer(b, &gotgbot.AnswerCallbackQueryOpts{Text: "Response discarded."})
-		b.EditMessageText("🗑️ <i>AI response discarded.</i>", &gotgbot.EditMessageTextOpts{
+		b.EditMessageText(&gotgbot.EditMessageTextOpts{
+			Text:      "🗑️ <i>AI response discarded.</i>",
 			ChatId:    c.EffectiveChat.Id,
 			MessageId: c.EffectiveMessage.MessageId,
 			ParseMode: "HTML",
@@ -2579,7 +2739,8 @@ func AIPendingCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 
 	// action == "send"
 	cq.Answer(b, &gotgbot.AnswerCallbackQueryOpts{Text: "Sending to WhatsApp..."})
-	b.EditMessageText("📤 <i>Sending to WhatsApp...</i>", &gotgbot.EditMessageTextOpts{
+	b.EditMessageText(&gotgbot.EditMessageTextOpts{
+		Text:      "📤 <i>Sending to WhatsApp...</i>",
 		ChatId:    c.EffectiveChat.Id,
 		MessageId: c.EffectiveMessage.MessageId,
 		ParseMode: "HTML",
@@ -2591,8 +2752,9 @@ func AIPendingCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 
 	sendResp, err := utils.WaSendText(waChatJID, entry.AIResponse, entry.StanzaID, entry.ParticipantID, quotedMsg, entry.IsReply)
 	if err != nil {
-		b.EditMessageText(fmt.Sprintf("🤖 <b>AI response generated:</b>\n\n%s\n\n❌ <i>Failed to send to WhatsApp: %s</i>",
-			html.EscapeString(entry.AIResponse), html.EscapeString(err.Error())), &gotgbot.EditMessageTextOpts{
+		b.EditMessageText(&gotgbot.EditMessageTextOpts{
+			Text: fmt.Sprintf("🤖 <b>AI response generated:</b>\n\n%s\n\n❌ <i>Failed to send to WhatsApp: %s</i>",
+				html.EscapeString(entry.AIResponse), html.EscapeString(err.Error())),
 			ChatId:    c.EffectiveChat.Id,
 			MessageId: c.EffectiveMessage.MessageId,
 			ParseMode: "HTML",
@@ -2600,7 +2762,8 @@ func AIPendingCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 		return err
 	}
 
-	b.EditMessageText(fmt.Sprintf("✅ <b>AI response sent to WhatsApp:</b>\n\n%s", html.EscapeString(entry.AIResponse)), &gotgbot.EditMessageTextOpts{
+	b.EditMessageText(&gotgbot.EditMessageTextOpts{
+		Text:      fmt.Sprintf("✅ <b>AI response sent to WhatsApp:</b>\n\n%s", html.EscapeString(entry.AIResponse)),
 		ChatId:    c.EffectiveChat.Id,
 		MessageId: c.EffectiveMessage.MessageId,
 		ParseMode: "HTML",

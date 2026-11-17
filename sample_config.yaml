@@ -87,6 +87,7 @@ whatsapp:
   create_thread_for_info_updates: false  # If set to true, new thread will be created (if it doesn't exist) when profile picture changes for group/someone and when group metadata/members changes
   skip_pinned_messages: false             # If set to true, pinning/unpinning messages will not be synced to Telegram
   status_message_duration_seconds: 86400  # Duration in seconds for WhatsApp profile status. Default is 86400 (24h).
+  skip_offline_backlog: false             # If set to true, events queued while the bridge was offline will not be bridged (useful for local development/testing)
   #login_database:               # Uncomment only if you want to use something other than sqlite
   #  type: sqlite3
   #  url: file:wawebstore.db?foreign_keys=on
@@ -101,8 +102,14 @@ gemini:
   auto_reply_private: false       # If true, automatically answers incoming private WhatsApp messages using Gemini
 
 
-# Uncomment any one of these sections
-# Using the sqlite database will be easiest as it does not require any hosted database server and stores data in a single file on your device
+# Database holding the bridge's own state (chat <-> topic mapping, message ids, receipts).
+# sqlite is enabled by default: it needs no database server and keeps everything in
+# one file, so a fresh checkout works without further setup.
+database:
+  type: sqlite
+  path: ./gobot.sqlite.db
+
+# To use a server instead, comment out the sqlite block above and uncomment one of these.
 # Note: If you are using Docker, it is not recommended to change the database name. If you do, make sure to update it in the docker-compose file as well.
 
 #database:
@@ -113,10 +120,6 @@ gemini:
 #  dbname: gobot
 #  port: 5432
 #  time_zone: Asia/Kolkata
-
-#database:
-#  type: sqlite
-#  path: ./gobot.sqlite.db
 
 #database:
 #  type: mysql

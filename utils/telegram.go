@@ -1211,7 +1211,7 @@ func TgSendToWhatsApp(b *gotgbot.Bot, c *ext.Context,
 			if cfg.Telegram.TagAllEnabled {
 				textSplit := strings.Fields(strings.ToLower(msgToForward.Text))
 				if slices.Contains(textSplit, "@all") || slices.Contains(textSplit, "@everyone") || slices.Contains(textSplit, "@everybody") {
-				WaTagAll(waChatJID, msgToSend, sentMsg.ID, waClient.Store.ID.String(), true)
+					WaTagAll(waChatJID, msgToSend, sentMsg.ID, waClient.Store.ID.String(), true)
 				}
 			}
 		}
@@ -1232,6 +1232,10 @@ func TgSendToWhatsApp(b *gotgbot.Bot, c *ext.Context,
 				}
 				continue
 			}
+			if senderJID.ToNonAD().String() == waChatJID.ToNonAD().String() {
+				senderJID = waTypes.EmptyJID
+			}
+
 			err := waClient.MarkRead(context.Background(), msgIds, time.Now(), waChatJID, senderJID)
 			if err != nil {
 				logger.Warn(

@@ -18,7 +18,6 @@ on:
           - ubuntu-20.04
           - ubuntu-22.04
           - ubuntu-24.04
-          - debian-11
           - debian-12
       arch:
         description: 'Choose architecture'
@@ -47,7 +46,7 @@ jobs:
         SELECTED_DISTRO="${{ github.event.inputs.distro || 'all' }}"
         SELECTED_ARCH="${{ github.event.inputs.arch || 'all' }}"
 
-        DISTROS=("ubuntu-20.04" "ubuntu-22.04" "ubuntu-24.04" "debian-11" "debian-12")
+        DISTROS=("ubuntu-20.04" "ubuntu-22.04" "ubuntu-24.04" "debian-12")
         ARCHS=("amd64" "arm64")
 
         if [ "$SELECTED_DISTRO" != "all" ]; then
@@ -63,7 +62,6 @@ jobs:
             ubuntu-20.04) image="ubuntu:20.04" ;;
             ubuntu-22.04) image="ubuntu:22.04" ;;
             ubuntu-24.04) image="ubuntu:24.04" ;;
-            debian-11)    image="debian:11" ;;
             debian-12)    image="debian:12" ;;
             *) image="ubuntu:22.04" ;;
           esac

@@ -73,6 +73,16 @@ func WhatsAppEventHandler(evt interface{}) {
 			CallOfferNoticeEventHandler(v)
 		}
 
+	case *events.CallAccept:
+		if !cfg.WhatsApp.SkipCallNotifications {
+			CallAcceptEventHandler(v)
+		}
+
+	case *events.CallReject:
+		if !cfg.WhatsApp.SkipCallNotifications {
+			CallRejectEventHandler(v)
+		}
+
 	case *events.CallTerminate:
 		if !cfg.WhatsApp.SkipCallNotifications {
 			CallTerminateEventHandler(v)
@@ -1573,6 +1583,80 @@ func UndecryptableMessageEventHandler(v *events.UndecryptableMessage) {
 // Call events
 // ============================================================
 
+type tgCallMsgRef struct {
+	ChatID int64
+	MsgID  int64
+}
+
+type trackedCall struct {
+	CallID     string
+	CallerName string
+	CallerJID  string
+	GroupName  string
+	MediaType  string
+	Icon       string
+	TimeStr    string
+	StartTime  time.Time
+	IsGroup    bool
+	Accepted   bool
+	Messages   []tgCallMsgRef
+}
+
+var (
+	activeCallsLock sync.Mutex
+	activeCalls     = make(map[string]*trackedCall)
+)
+
+func storeActiveCall(call *trackedCall) {
+	activeCallsLock.Lock()
+	defer activeCallsLock.Unlock()
+
+	for k, c := range activeCalls {
+		if time.Since(c.StartTime) > 2*time.Hour {
+			delete(activeCalls, k)
+		}
+	}
+
+	if call.CallID != "" {
+		activeCalls[call.CallID] = call
+	}
+	if call.CallerJID != "" {
+		activeCalls[call.CallerJID] = call
+	}
+}
+
+func getActiveCall(callID string, callerJID string) *trackedCall {
+	activeCallsLock.Lock()
+	defer activeCallsLock.Unlock()
+
+	if callID != "" {
+		if c, ok := activeCalls[callID]; ok {
+			return c
+		}
+	}
+	if callerJID != "" {
+		if c, ok := activeCalls[callerJID]; ok {
+			return c
+		}
+	}
+	return nil
+}
+
+func removeActiveCall(call *trackedCall) {
+	if call == nil {
+		return
+	}
+	activeCallsLock.Lock()
+	defer activeCallsLock.Unlock()
+
+	if call.CallID != "" {
+		delete(activeCalls, call.CallID)
+	}
+	if call.CallerJID != "" {
+		delete(activeCalls, call.CallerJID)
+	}
+}
+
 func CallOfferEventHandler(v *events.CallOffer) {
 	var (
 		cfg   = state.State.Config
@@ -1597,32 +1681,68 @@ func CallOfferEventHandler(v *events.CallOffer) {
 		mediaType = "video"
 	}
 
-	if !v.GroupJID.IsEmpty() {
-		groupName := utils.WaGetGroupName(v.GroupJID)
-		bridgeText := fmt.Sprintf(
-			"#calls\n\n%s <b>Chiamata %s di gruppo in arrivo</b>\n\n👥 <b>Gruppo:</b> %s\n🧑 <b>Avviata da:</b> %s\n🕛 <b>Orario:</b> %s",
+	callerJID := v.From.ToNonAD()
+	if callerJID.IsEmpty() {
+		callerJID = v.CallCreator.ToNonAD()
+	}
+
+	var bridgeText string
+	var groupName string
+	isGroup := !v.GroupJID.IsEmpty()
+
+	if isGroup {
+		groupName = utils.WaGetGroupName(v.GroupJID)
+		bridgeText = fmt.Sprintf(
+			"#calls\n\n%s <b>Chiamata %s di gruppo in arrivo...</b>\n\n👥 <b>Gruppo:</b> %s\n🧑 <b>Avviata da:</b> %s\n🕛 <b>Orario:</b> %s",
 			icon, mediaType, html.EscapeString(groupName), html.EscapeString(callerName), html.EscapeString(timeStr),
 		)
-		utils.TgSendTextById(tgBot, cfg.Telegram.TargetChatID, callThreadId, bridgeText)
-
-		if groupTgThreadId, found, err := database.ChatThreadGetTgFromWa(v.GroupJID.String(), cfg.Telegram.TargetChatID); err == nil && found && groupTgThreadId != 0 {
-			utils.TgSendTextById(tgBot, cfg.Telegram.TargetChatID, groupTgThreadId, bridgeText)
-		}
 	} else {
-		bridgeText := fmt.Sprintf(
-			"#calls\n\n%s <b>Chiamata %s in arrivo</b>\n\n🧑 <b>Da:</b> %s\n🕛 <b>Orario:</b> %s",
+		bridgeText = fmt.Sprintf(
+			"#calls\n\n%s <b>Chiamata %s in arrivo...</b>\n\n🧑 <b>Da:</b> %s\n🕛 <b>Orario:</b> %s",
 			icon, mediaType, html.EscapeString(callerName), html.EscapeString(timeStr),
 		)
-		utils.TgSendTextById(tgBot, cfg.Telegram.TargetChatID, callThreadId, bridgeText)
+	}
 
-		callerJID := v.From.ToNonAD()
-		if callerJID.IsEmpty() {
-			callerJID = v.CallCreator.ToNonAD()
+	var msgRefs []tgCallMsgRef
+
+	sentMsg, err := tgBot.SendMessage(cfg.Telegram.TargetChatID, bridgeText, &gotgbot.SendMessageOpts{
+		MessageThreadId: callThreadId,
+	})
+	if err == nil && sentMsg != nil {
+		msgRefs = append(msgRefs, tgCallMsgRef{ChatID: cfg.Telegram.TargetChatID, MsgID: sentMsg.MessageId})
+	}
+
+	if isGroup {
+		if groupTgThreadId, found, err := database.ChatThreadGetTgFromWa(v.GroupJID.String(), cfg.Telegram.TargetChatID); err == nil && found && groupTgThreadId != 0 {
+			if sentGroupMsg, err := tgBot.SendMessage(cfg.Telegram.TargetChatID, bridgeText, &gotgbot.SendMessageOpts{
+				MessageThreadId: groupTgThreadId,
+			}); err == nil && sentGroupMsg != nil {
+				msgRefs = append(msgRefs, tgCallMsgRef{ChatID: cfg.Telegram.TargetChatID, MsgID: sentGroupMsg.MessageId})
+			}
 		}
+	} else {
 		if pvtTgThreadId, found, err := database.ChatThreadGetTgFromWa(callerJID.String(), cfg.Telegram.TargetChatID); err == nil && found && pvtTgThreadId != 0 {
-			utils.TgSendTextById(tgBot, cfg.Telegram.TargetChatID, pvtTgThreadId, bridgeText)
+			if sentPvtMsg, err := tgBot.SendMessage(cfg.Telegram.TargetChatID, bridgeText, &gotgbot.SendMessageOpts{
+				MessageThreadId: pvtTgThreadId,
+			}); err == nil && sentPvtMsg != nil {
+				msgRefs = append(msgRefs, tgCallMsgRef{ChatID: cfg.Telegram.TargetChatID, MsgID: sentPvtMsg.MessageId})
+			}
 		}
 	}
+
+	call := &trackedCall{
+		CallID:     v.CallID,
+		CallerName: callerName,
+		CallerJID:  callerJID.String(),
+		GroupName:  groupName,
+		MediaType:  mediaType,
+		Icon:       icon,
+		TimeStr:    timeStr,
+		StartTime:  v.Timestamp,
+		IsGroup:    isGroup,
+		Messages:   msgRefs,
+	}
+	storeActiveCall(call)
 }
 
 func CallOfferNoticeEventHandler(v *events.CallOfferNotice) {
@@ -1654,16 +1774,117 @@ func CallOfferNoticeEventHandler(v *events.CallOfferNotice) {
 	}
 
 	bridgeText := fmt.Sprintf(
-		"#calls\n\n%s <b>Chiamata %s di gruppo avviata</b>\n\n👥 <b>Gruppo:</b> %s\n🧑 <b>Avviata da:</b> %s\n🕛 <b>Orario:</b> %s",
+		"#calls\n\n%s <b>Chiamata %s di gruppo avviata...</b>\n\n👥 <b>Gruppo:</b> %s\n🧑 <b>Avviata da:</b> %s\n🕛 <b>Orario:</b> %s",
 		icon, mediaType, html.EscapeString(groupName), html.EscapeString(callerName), html.EscapeString(timeStr),
 	)
-	utils.TgSendTextById(tgBot, cfg.Telegram.TargetChatID, callThreadId, bridgeText)
+
+	var msgRefs []tgCallMsgRef
+
+	sentMsg, err := tgBot.SendMessage(cfg.Telegram.TargetChatID, bridgeText, &gotgbot.SendMessageOpts{
+		MessageThreadId: callThreadId,
+	})
+	if err == nil && sentMsg != nil {
+		msgRefs = append(msgRefs, tgCallMsgRef{ChatID: cfg.Telegram.TargetChatID, MsgID: sentMsg.MessageId})
+	}
 
 	if !v.GroupJID.IsEmpty() {
 		if groupTgThreadId, found, err := database.ChatThreadGetTgFromWa(v.GroupJID.String(), cfg.Telegram.TargetChatID); err == nil && found && groupTgThreadId != 0 {
-			utils.TgSendTextById(tgBot, cfg.Telegram.TargetChatID, groupTgThreadId, bridgeText)
+			if sentGroupMsg, err := tgBot.SendMessage(cfg.Telegram.TargetChatID, bridgeText, &gotgbot.SendMessageOpts{
+				MessageThreadId: groupTgThreadId,
+			}); err == nil && sentGroupMsg != nil {
+				msgRefs = append(msgRefs, tgCallMsgRef{ChatID: cfg.Telegram.TargetChatID, MsgID: sentGroupMsg.MessageId})
+			}
 		}
 	}
+
+	callerJID := v.From.ToNonAD()
+	if callerJID.IsEmpty() {
+		callerJID = v.CallCreator.ToNonAD()
+	}
+
+	call := &trackedCall{
+		CallID:     v.CallID,
+		CallerName: callerName,
+		CallerJID:  callerJID.String(),
+		GroupName:  groupName,
+		MediaType:  mediaType,
+		Icon:       icon,
+		TimeStr:    timeStr,
+		StartTime:  v.Timestamp,
+		IsGroup:    true,
+		Messages:   msgRefs,
+	}
+	storeActiveCall(call)
+}
+
+func CallAcceptEventHandler(v *events.CallAccept) {
+	tgBot := state.State.TelegramBot
+	callerJID := v.From.ToNonAD()
+	if callerJID.IsEmpty() {
+		callerJID = v.CallCreator.ToNonAD()
+	}
+
+	call := getActiveCall(v.CallID, callerJID.String())
+	if call == nil {
+		return
+	}
+	call.Accepted = true
+
+	var updatedText string
+	if call.IsGroup {
+		updatedText = fmt.Sprintf(
+			"#calls\n\n%s <b>Chiamata %s di gruppo in corso</b> (Risposta)\n\n👥 <b>Gruppo:</b> %s\n🧑 <b>Avviata da:</b> %s\n🕛 <b>Avviata:</b> %s",
+			call.Icon, call.MediaType, html.EscapeString(call.GroupName), html.EscapeString(call.CallerName), html.EscapeString(call.TimeStr),
+		)
+	} else {
+		updatedText = fmt.Sprintf(
+			"#calls\n\n%s <b>Chiamata %s in corso</b> (Risposta)\n\n🧑 <b>Da:</b> %s\n🕛 <b>Avviata:</b> %s",
+			call.Icon, call.MediaType, html.EscapeString(call.CallerName), html.EscapeString(call.TimeStr),
+		)
+	}
+
+	for _, ref := range call.Messages {
+		_, _, _ = tgBot.EditMessageText(&gotgbot.EditMessageTextOpts{
+			ChatId:    ref.ChatID,
+			MessageId: ref.MsgID,
+			Text:      updatedText,
+		})
+	}
+}
+
+func CallRejectEventHandler(v *events.CallReject) {
+	tgBot := state.State.TelegramBot
+	callerJID := v.From.ToNonAD()
+	if callerJID.IsEmpty() {
+		callerJID = v.CallCreator.ToNonAD()
+	}
+
+	call := getActiveCall(v.CallID, callerJID.String())
+	if call == nil {
+		return
+	}
+
+	var updatedText string
+	if call.IsGroup {
+		updatedText = fmt.Sprintf(
+			"#calls\n\n🚫 <b>Chiamata %s di gruppo rifiutata</b>\n\n👥 <b>Gruppo:</b> %s\n🧑 <b>Avviata da:</b> %s\n🕛 <b>Orario:</b> %s",
+			call.MediaType, html.EscapeString(call.GroupName), html.EscapeString(call.CallerName), html.EscapeString(call.TimeStr),
+		)
+	} else {
+		updatedText = fmt.Sprintf(
+			"#calls\n\n🚫 <b>Chiamata %s rifiutata</b>\n\n🧑 <b>Da:</b> %s\n🕛 <b>Orario:</b> %s",
+			call.MediaType, html.EscapeString(call.CallerName), html.EscapeString(call.TimeStr),
+		)
+	}
+
+	for _, ref := range call.Messages {
+		_, _, _ = tgBot.EditMessageText(&gotgbot.EditMessageTextOpts{
+			ChatId:    ref.ChatID,
+			MessageId: ref.MsgID,
+			Text:      updatedText,
+		})
+	}
+	removeActiveCall(call)
 }
 
 func CallTerminateEventHandler(v *events.CallTerminate) {
@@ -1672,11 +1893,52 @@ func CallTerminateEventHandler(v *events.CallTerminate) {
 		tgBot = state.State.TelegramBot
 	)
 
+	callerJID := v.From.ToNonAD()
+	if callerJID.IsEmpty() {
+		callerJID = v.CallCreator.ToNonAD()
+	}
+
+	call := getActiveCall(v.CallID, callerJID.String())
 	reason := strings.ToLower(v.Reason)
-	if reason != "timeout" && !strings.Contains(reason, "miss") {
+
+	if call != nil {
+		defer removeActiveCall(call)
+
+		var statusHeader string
+		if call.Accepted {
+			dur := time.Since(call.StartTime).Round(time.Second)
+			durStr := dur.String()
+			statusHeader = fmt.Sprintf("🏁 <b>Chiamata %s conclusa</b>\n⏱️ <b>Durata:</b> %s", call.MediaType, durStr)
+		} else if reason == "reject" || reason == "declined" {
+			statusHeader = fmt.Sprintf("🚫 <b>Chiamata %s rifiutata</b>", call.MediaType)
+		} else {
+			statusHeader = fmt.Sprintf("❌ <b>Chiamata %s persa</b>", call.MediaType)
+		}
+
+		var updatedText string
+		if call.IsGroup {
+			updatedText = fmt.Sprintf(
+				"#calls\n\n%s\n\n👥 <b>Gruppo:</b> %s\n🧑 <b>Avviata da:</b> %s\n🕛 <b>Orario:</b> %s",
+				statusHeader, html.EscapeString(call.GroupName), html.EscapeString(call.CallerName), html.EscapeString(call.TimeStr),
+			)
+		} else {
+			updatedText = fmt.Sprintf(
+				"#calls\n\n%s\n\n🧑 <b>Da:</b> %s\n🕛 <b>Orario:</b> %s",
+				statusHeader, html.EscapeString(call.CallerName), html.EscapeString(call.TimeStr),
+			)
+		}
+
+		for _, ref := range call.Messages {
+			_, _, _ = tgBot.EditMessageText(&gotgbot.EditMessageTextOpts{
+				ChatId:    ref.ChatID,
+				MessageId: ref.MsgID,
+				Text:      updatedText,
+			})
+		}
 		return
 	}
 
+	// Fallback if not found in memory (e.g. restart during call)
 	callThreadId, err := utils.TgGetOrMakeThreadFromWa_String("calls", cfg.Telegram.TargetChatID, "Calls")
 	if err != nil {
 		return
@@ -1686,7 +1948,7 @@ func CallTerminateEventHandler(v *events.CallTerminate) {
 	callerName := utils.WaGetContactName(v.CallCreator)
 
 	bridgeText := fmt.Sprintf(
-		"#calls\n\n⚠️ <b>Chiamata persa</b>\n\n🧑 <b>Da:</b> %s\n🕛 <b>Orario:</b> %s",
+		"#calls\n\n❌ <b>Chiamata persa / terminata</b>\n\n🧑 <b>Da:</b> %s\n🕛 <b>Orario:</b> %s",
 		html.EscapeString(callerName), html.EscapeString(timeStr),
 	)
 	utils.TgSendTextById(tgBot, cfg.Telegram.TargetChatID, callThreadId, bridgeText)

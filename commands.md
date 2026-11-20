@@ -20,6 +20,10 @@ This document lists all the Telegram commands available in the WhatsApp-Telegram
 - **Description:** Fetches all WhatsApp groups that the connected account is part of, returning their names and JIDs (Group IDs).
 - **Usage:** `/getwagroups`
 
+### `/getwachannels`
+- **Description:** Fetches all subscribed WhatsApp channels/newsletters, returning their names and JIDs.
+- **Usage:** `/getwachannels`
+
 ### `/findcontact <query>`
 - **Description:** Performs a fuzzy find on your WhatsApp contacts by name to retrieve their JIDs.
 - **Usage:** `/findcontact John Doe`

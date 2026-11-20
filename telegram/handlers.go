@@ -74,6 +74,10 @@ func AddTelegramHandlers() {
 			"Get all the WhatsApp groups along with their JIDs",
 		},
 		waTgBridgeCommand{
+			handlers.NewCommand("getwachannels", GetWhatsAppChannelsHandler),
+			"Get all subscribed WhatsApp channels with their JIDs",
+		},
+		waTgBridgeCommand{
 			handlers.NewCommand("findcontact", FindContactHandler),
 			"Fuzzy find contact JIDs from names in WhatsApp",
 		},
@@ -465,6 +469,41 @@ func GetWhatsAppGroupsHandler(b *gotgbot.Bot, c *ext.Context) error {
 		outputString += fmt.Sprintf("%v. %s [ <code>%s</code> ]\n",
 			groupNum+1, html.EscapeString(group.Name),
 			html.EscapeString(group.JID.String()))
+
+		if len(outputString) >= 1800 {
+			utils.TgReplyTextByContext(b, c, outputString, nil, false)
+			time.Sleep(500 * time.Millisecond)
+			outputString = ""
+		}
+	}
+
+	if len(outputString) > 0 {
+		_, err = utils.TgReplyTextByContext(b, c, outputString, nil, false)
+		return err
+	}
+	return nil
+}
+
+func GetWhatsAppChannelsHandler(b *gotgbot.Bot, c *ext.Context) error {
+	if !utils.TgUpdateIsAuthorized(b, c) {
+		return nil
+	}
+
+	newsletters, err := utils.WaGetSubscribedNewsletters()
+	if err != nil {
+		return utils.TgReplyWithErrorByContext(b, c, "Failed to retrieve WhatsApp channels", err)
+	}
+
+	if len(newsletters) == 0 {
+		_, err = utils.TgReplyTextByContext(b, c, "No subscribed WhatsApp channels found.", nil, false)
+		return err
+	}
+
+	outputString := "📢 <b>Subscribed WhatsApp Channels:</b>\n\n"
+	for idx, nl := range newsletters {
+		outputString += fmt.Sprintf("%d. %s [ <code>%s</code> ]\n",
+			idx+1, html.EscapeString(nl.ThreadMeta.Name.Text),
+			html.EscapeString(nl.ID.String()))
 
 		if len(outputString) >= 1800 {
 			utils.TgReplyTextByContext(b, c, outputString, nil, false)
@@ -1193,6 +1232,8 @@ func SyncTopicNamesHandler(b *gotgbot.Bot, c *ext.Context) error {
 		var newName string
 		if waChatJid.Server == waTypes.GroupServer {
 			newName = utils.WaGetGroupName(waChatJid)
+		} else if waChatJid.Server == waTypes.NewsletterServer {
+			newName = "📢 " + utils.WaGetNewsletterName(waChatJid)
 		} else {
 			newName = utils.WaGetContactName(waChatJid)
 		}
@@ -1466,18 +1507,21 @@ func TgMakeMenuKeyboard() *gotgbot.InlineKeyboardMarkup {
 		InlineKeyboard: [][]gotgbot.InlineKeyboardButton{
 			{
 				{Text: "📊 Bridge Status", CallbackData: "menu_status"},
-				{Text: "📋 WhatsApp Groups", CallbackData: "menu_groups_0"},
-			},
-			{
-				{Text: "🔄 Sync Contacts", CallbackData: "menu_sync"},
 				{Text: "⚙️ Chat & Threads", CallbackData: "menu_chats"},
 			},
 			{
-				{Text: "🛠️ Tools & Utils", CallbackData: "menu_tools"},
-				{Text: "🔌 Restart WhatsApp", CallbackData: "menu_restartwa"},
+				{Text: "📋 Groups", CallbackData: "menu_groups_0"},
+				{Text: "📢 Channels", CallbackData: "menu_channels_0"},
 			},
 			{
+				{Text: "🔄 Sync Contacts", CallbackData: "menu_sync"},
+				{Text: "🛠️ Tools & Utils", CallbackData: "menu_tools"},
+			},
+			{
+				{Text: "🔌 Restart WA", CallbackData: "menu_restartwa"},
 				{Text: "❓ Help", CallbackData: "menu_help"},
+			},
+			{
 				{Text: "❌ Close Menu", CallbackData: "menu_close"},
 			},
 		},
@@ -1649,6 +1693,79 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 			navRow = append(navRow, gotgbot.InlineKeyboardButton{
 				Text:         "▶️ Next",
 				CallbackData: fmt.Sprintf("menu_groups_%d", page+1),
+			})
+		}
+		if len(navRow) > 0 {
+			buttons = append(buttons, navRow)
+		}
+		buttons = append(buttons, []gotgbot.InlineKeyboardButton{{
+			Text:         "🔙 Back",
+			CallbackData: "menu_main",
+		}})
+
+		_, _, err = b.EditMessageText(&gotgbot.EditMessageTextOpts{
+			Text:        outputString,
+			ChatId:      c.EffectiveChat.Id,
+			MessageId:   c.EffectiveMessage.MessageId,
+			ReplyMarkup: gotgbot.InlineKeyboardMarkup{InlineKeyboard: buttons},
+			ParseMode:   "HTML",
+		})
+		_, _ = cq.Answer(b, nil)
+		return err
+
+	} else if strings.HasPrefix(data, "menu_channels_") || data == "menu_channels" {
+		page := 0
+		if strings.HasPrefix(data, "menu_channels_") {
+			fmt.Sscanf(strings.TrimPrefix(data, "menu_channels_"), "%d", &page)
+		}
+
+		newsletters, err := utils.WaGetSubscribedNewsletters()
+		if err != nil {
+			cq.Answer(b, &gotgbot.AnswerCallbackQueryOpts{Text: "Failed to fetch channels: " + err.Error(), ShowAlert: true})
+			return err
+		}
+
+		itemsPerPage := 8
+		totalPages := (len(newsletters) + itemsPerPage - 1) / itemsPerPage
+		if totalPages == 0 {
+			totalPages = 1
+		}
+		if page >= totalPages {
+			page = 0
+		}
+		if page < 0 {
+			page = 0
+		}
+		startIdx := page * itemsPerPage
+		endIdx := startIdx + itemsPerPage
+		if endIdx > len(newsletters) {
+			endIdx = len(newsletters)
+		}
+
+		outputString := fmt.Sprintf("📢 <b>WhatsApp Channels</b> (Page %d/%d - Total %d):\n\n", page+1, totalPages, len(newsletters))
+		if len(newsletters) == 0 {
+			outputString += "<i>No subscribed channels found.</i>\n"
+		} else {
+			for i := startIdx; i < endIdx; i++ {
+				nl := newsletters[i]
+				outputString += fmt.Sprintf("%d. <b>%s</b>\n   ↳ <code>%s</code>\n",
+					i+1, html.EscapeString(nl.ThreadMeta.Name.Text),
+					html.EscapeString(nl.ID.String()))
+			}
+		}
+
+		var buttons [][]gotgbot.InlineKeyboardButton
+		var navRow []gotgbot.InlineKeyboardButton
+		if page > 0 {
+			navRow = append(navRow, gotgbot.InlineKeyboardButton{
+				Text:         "◀️ Prev",
+				CallbackData: fmt.Sprintf("menu_channels_%d", page-1),
+			})
+		}
+		if endIdx < len(newsletters) {
+			navRow = append(navRow, gotgbot.InlineKeyboardButton{
+				Text:         "▶️ Next",
+				CallbackData: fmt.Sprintf("menu_channels_%d", page+1),
 			})
 		}
 		if len(navRow) > 0 {
@@ -1893,6 +2010,8 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 				chatName := waChatID
 				if waChatJID.Server == waTypes.GroupServer {
 					chatName = utils.WaGetGroupName(waChatJID)
+				} else if waChatJID.Server == waTypes.NewsletterServer {
+					chatName = utils.WaGetNewsletterName(waChatJID)
 				} else {
 					chatName = utils.WaGetContactName(waChatJID)
 				}
@@ -1903,6 +2022,10 @@ func MenuCallbackHandler(b *gotgbot.Bot, c *ext.Context) error {
 				if waChatJID.Server == waTypes.GroupServer {
 					rows = append(rows, []gotgbot.InlineKeyboardButton{
 						{Text: "👥 Group Members", CallbackData: "menu_group_members_0"},
+						{Text: "🖼️ Profile Picture", CallbackData: "menu_chat_profilepic"},
+					})
+				} else if waChatJID.Server == waTypes.NewsletterServer {
+					rows = append(rows, []gotgbot.InlineKeyboardButton{
 						{Text: "🖼️ Profile Picture", CallbackData: "menu_chat_profilepic"},
 					})
 				} else {

@@ -2,10 +2,12 @@ package utils
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"html"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"watgbridge/database"
@@ -356,3 +358,49 @@ func WaSendText(chat types.JID, text, stanzaId, participantId string, quotedMsg 
 
 	return waClient.SendMessage(context.Background(), chat, msgToSend)
 }
+
+var newsletterNameCache sync.Map // key: jid.String() -> string
+
+// WaGetNewsletterName returns the cached or fetched title/name of a WhatsApp channel (newsletter).
+func WaGetNewsletterName(jid types.JID) string {
+	if val, ok := newsletterNameCache.Load(jid.String()); ok {
+		if name, ok := val.(string); ok && name != "" {
+			return name
+		}
+	}
+
+	waClient := state.State.WhatsAppClient
+	if waClient == nil {
+		return jid.User
+	}
+
+	meta, err := waClient.GetNewsletterInfo(context.Background(), jid)
+	if err != nil || meta == nil || meta.ThreadMeta.Name.Text == "" {
+		return jid.User
+	}
+
+	name := meta.ThreadMeta.Name.Text
+	newsletterNameCache.Store(jid.String(), name)
+	return name
+}
+
+// WaGetSubscribedNewsletters retrieves all channels followed by the user and populates the cache.
+func WaGetSubscribedNewsletters() ([]*types.NewsletterMetadata, error) {
+	waClient := state.State.WhatsAppClient
+	if waClient == nil {
+		return nil, errors.New("whatsapp client not connected")
+	}
+
+	newsletters, err := waClient.GetSubscribedNewsletters(context.Background())
+	if err != nil {
+		return nil, err
+	}
+
+	for _, n := range newsletters {
+		if n != nil && n.ThreadMeta.Name.Text != "" {
+			newsletterNameCache.Store(n.ID.String(), n.ThreadMeta.Name.Text)
+		}
+	}
+	return newsletters, nil
+}
+

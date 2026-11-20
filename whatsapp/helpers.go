@@ -144,6 +144,14 @@ func resolveThreadId(info waTypes.MessageInfo, cfg *state.Config, tgBot *gotgbot
 		)
 	}
 
+	if info.Chat.Server == waTypes.NewsletterServer {
+		channelName := utils.WaGetNewsletterName(info.Chat)
+		threadTitle := "📢 " + channelName
+		return utils.TgGetOrMakeThreadFromWa_String(
+			info.Chat.String(), cfg.Telegram.TargetChatID, threadTitle,
+		)
+	}
+
 	if info.IsIncomingBroadcast() {
 		if info.MessageSource.AddressingMode == waTypes.AddressingModePN || info.MessageSource.SenderAlt.IsEmpty() {
 			jid := info.MessageSource.Sender.ToNonAD()
@@ -170,7 +178,10 @@ func resolveThreadId(info waTypes.MessageInfo, cfg *state.Config, tgBot *gotgbot
 func buildBridgedHeader(info waTypes.MessageInfo, cfg *state.Config, isEdited bool) string {
 	var text string
 
-	if cfg.WhatsApp.SkipChatDetails {
+	if info.Chat.Server == waTypes.NewsletterServer {
+		channelName := utils.WaGetNewsletterName(info.Chat)
+		text += fmt.Sprintf("📢: <b>%s</b>\n", html.EscapeString(channelName))
+	} else if cfg.WhatsApp.SkipChatDetails {
 		if info.IsIncomingBroadcast() {
 			text += "👥: <b>(Broadcast)</b>\n"
 		} else if info.IsFromMe {

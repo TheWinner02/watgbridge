@@ -35,6 +35,10 @@ func eventTimestamp(evt interface{}) (time.Time, bool) {
 		return v.Timestamp, true
 	case *events.CallOffer:
 		return v.Timestamp, true
+	case *events.CallOfferNotice:
+		return v.Timestamp, true
+	case *events.CallTerminate:
+		return v.Timestamp, true
 	case *events.Picture:
 		return v.Timestamp, true
 	case *events.GroupInfo:

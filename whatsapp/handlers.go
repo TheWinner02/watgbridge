@@ -64,7 +64,19 @@ func WhatsAppEventHandler(evt interface{}) {
 		UserAboutEventHandler(v)
 
 	case *events.CallOffer:
-		CallOfferEventHandler(v)
+		if !cfg.WhatsApp.SkipCallNotifications {
+			CallOfferEventHandler(v)
+		}
+
+	case *events.CallOfferNotice:
+		if !cfg.WhatsApp.SkipCallNotifications {
+			CallOfferNoticeEventHandler(v)
+		}
+
+	case *events.CallTerminate:
+		if !cfg.WhatsApp.SkipCallNotifications {
+			CallTerminateEventHandler(v)
+		}
 
 	case *events.UndecryptableMessage:
 		UndecryptableMessageEventHandler(v)
@@ -639,12 +651,21 @@ func MessageFromOthersEventHandler(text string, v *events.Message, isEdited bool
 			zap.String("chat_jid", v.Info.Chat.String()),
 		)
 		return
+	} else if v.Info.Chat.Server == waTypes.NewsletterServer && cfg.WhatsApp.SkipNewsletters {
+		logger.Debug("returning because newsletter from an ignored/skipped chat",
+			zap.String("event_id", v.Info.ID),
+			zap.String("chat_jid", v.Info.Chat.String()),
+		)
+		return
 	}
 
-	replyMarkup := utils.TgBuildUrlButton(
-		utils.WaGetContactName(v.Info.Sender),
-		fmt.Sprintf("https://wa.me/%s", v.Info.MessageSource.Sender.ToNonAD().User),
-	)
+	var replyMarkup gotgbot.InlineKeyboardMarkup
+	if v.Info.Chat.Server != waTypes.NewsletterServer {
+		replyMarkup = utils.TgBuildUrlButton(
+			utils.WaGetContactName(v.Info.Sender),
+			fmt.Sprintf("https://wa.me/%s", v.Info.MessageSource.Sender.ToNonAD().User),
+		)
+	}
 
 	// Handle @all / @everyone from allowed groups
 	if !isEdited {
@@ -1540,7 +1561,6 @@ func CallOfferEventHandler(v *events.CallOffer) {
 		tgBot = state.State.TelegramBot
 	)
 
-	callerName := utils.WaGetContactName(v.CallCreator)
 	callThreadId, err := utils.TgGetOrMakeThreadFromWa_String("calls", cfg.Telegram.TargetChatID, "Calls")
 	if err != nil {
 		utils.TgSendErrorById(tgBot, cfg.Telegram.TargetChatID, 0,
@@ -1548,10 +1568,108 @@ func CallOfferEventHandler(v *events.CallOffer) {
 		return
 	}
 
+	timeStr := v.Timestamp.In(state.State.LocalLocation).Format(cfg.TimeFormat)
+	callerName := utils.WaGetContactName(v.CallCreator)
+
+	isVideo := v.Data != nil && (len(v.Data.GetChildrenByTag("video")) > 0 || v.Data.AttrGetter().String("media") == "video")
+	icon := "📞"
+	mediaType := "vocale"
+	if isVideo {
+		icon = "📹"
+		mediaType = "video"
+	}
+
+	if !v.GroupJID.IsEmpty() {
+		groupName := utils.WaGetGroupName(v.GroupJID)
+		bridgeText := fmt.Sprintf(
+			"#calls\n\n%s <b>Chiamata %s di gruppo in arrivo</b>\n\n👥 <b>Gruppo:</b> %s\n🧑 <b>Avviata da:</b> %s\n🕛 <b>Orario:</b> %s",
+			icon, mediaType, html.EscapeString(groupName), html.EscapeString(callerName), html.EscapeString(timeStr),
+		)
+		utils.TgSendTextById(tgBot, cfg.Telegram.TargetChatID, callThreadId, bridgeText)
+
+		if groupTgThreadId, found, err := database.ChatThreadGetTgFromWa(v.GroupJID.String(), cfg.Telegram.TargetChatID); err == nil && found && groupTgThreadId != 0 {
+			utils.TgSendTextById(tgBot, cfg.Telegram.TargetChatID, groupTgThreadId, bridgeText)
+		}
+	} else {
+		bridgeText := fmt.Sprintf(
+			"#calls\n\n%s <b>Chiamata %s in arrivo</b>\n\n🧑 <b>Da:</b> %s\n🕛 <b>Orario:</b> %s",
+			icon, mediaType, html.EscapeString(callerName), html.EscapeString(timeStr),
+		)
+		utils.TgSendTextById(tgBot, cfg.Telegram.TargetChatID, callThreadId, bridgeText)
+
+		callerJID := v.From.ToNonAD()
+		if callerJID.IsEmpty() {
+			callerJID = v.CallCreator.ToNonAD()
+		}
+		if pvtTgThreadId, found, err := database.ChatThreadGetTgFromWa(callerJID.String(), cfg.Telegram.TargetChatID); err == nil && found && pvtTgThreadId != 0 {
+			utils.TgSendTextById(tgBot, cfg.Telegram.TargetChatID, pvtTgThreadId, bridgeText)
+		}
+	}
+}
+
+func CallOfferNoticeEventHandler(v *events.CallOfferNotice) {
+	var (
+		cfg   = state.State.Config
+		tgBot = state.State.TelegramBot
+	)
+
+	callThreadId, err := utils.TgGetOrMakeThreadFromWa_String("calls", cfg.Telegram.TargetChatID, "Calls")
+	if err != nil {
+		utils.TgSendErrorById(tgBot, cfg.Telegram.TargetChatID, 0,
+			"Failed to create/retreive corresponding thread id for calls", err)
+		return
+	}
+
+	timeStr := v.Timestamp.In(state.State.LocalLocation).Format(cfg.TimeFormat)
+	callerName := utils.WaGetContactName(v.CallCreator)
+
+	icon := "📞"
+	mediaType := "vocale"
+	if v.Media == "video" {
+		icon = "📹"
+		mediaType = "video"
+	}
+
+	groupName := "Gruppo WhatsApp"
+	if !v.GroupJID.IsEmpty() {
+		groupName = utils.WaGetGroupName(v.GroupJID)
+	}
+
 	bridgeText := fmt.Sprintf(
-		"#calls\n\n🧑: <b>%s</b>\n🕛: <b>%s</b>\n\n<i>You received a new call</i>",
-		html.EscapeString(callerName),
-		html.EscapeString(v.Timestamp.In(state.State.LocalLocation).Format(cfg.TimeFormat)),
+		"#calls\n\n%s <b>Chiamata %s di gruppo avviata</b>\n\n👥 <b>Gruppo:</b> %s\n🧑 <b>Avviata da:</b> %s\n🕛 <b>Orario:</b> %s",
+		icon, mediaType, html.EscapeString(groupName), html.EscapeString(callerName), html.EscapeString(timeStr),
+	)
+	utils.TgSendTextById(tgBot, cfg.Telegram.TargetChatID, callThreadId, bridgeText)
+
+	if !v.GroupJID.IsEmpty() {
+		if groupTgThreadId, found, err := database.ChatThreadGetTgFromWa(v.GroupJID.String(), cfg.Telegram.TargetChatID); err == nil && found && groupTgThreadId != 0 {
+			utils.TgSendTextById(tgBot, cfg.Telegram.TargetChatID, groupTgThreadId, bridgeText)
+		}
+	}
+}
+
+func CallTerminateEventHandler(v *events.CallTerminate) {
+	var (
+		cfg   = state.State.Config
+		tgBot = state.State.TelegramBot
+	)
+
+	reason := strings.ToLower(v.Reason)
+	if reason != "timeout" && !strings.Contains(reason, "miss") {
+		return
+	}
+
+	callThreadId, err := utils.TgGetOrMakeThreadFromWa_String("calls", cfg.Telegram.TargetChatID, "Calls")
+	if err != nil {
+		return
+	}
+
+	timeStr := v.Timestamp.In(state.State.LocalLocation).Format(cfg.TimeFormat)
+	callerName := utils.WaGetContactName(v.CallCreator)
+
+	bridgeText := fmt.Sprintf(
+		"#calls\n\n⚠️ <b>Chiamata persa</b>\n\n🧑 <b>Da:</b> %s\n🕛 <b>Orario:</b> %s",
+		html.EscapeString(callerName), html.EscapeString(timeStr),
 	)
 	utils.TgSendTextById(tgBot, cfg.Telegram.TargetChatID, callThreadId, bridgeText)
 }

@@ -83,6 +83,8 @@ type Config struct {
 		SkipPinnedMessages             bool     `yaml:"skip_pinned_messages"`
 		StatusMessageDurationSeconds   uint32   `yaml:"status_message_duration_seconds"`
 		SkipOfflineBacklog             bool     `yaml:"skip_offline_backlog"`
+		SkipNewsletters                bool     `yaml:"skip_newsletters"`
+		SkipCallNotifications          bool     `yaml:"skip_call_notifications"`
 	} `yaml:"whatsapp"`
 
 	Gemini struct {

@@ -1436,6 +1436,24 @@ func (bc *bridgeContext) handleTextOrReaction(text string, v *events.Message, is
 			})
 	}
 
+	if err != nil && strings.Contains(err.Error(), "message thread not found") {
+		bc.logger.Warn("telegram thread not found (topic was likely deleted), recreating topic...",
+			zap.Int64("stale_thread_id", bc.threadId),
+			zap.String("chat", bc.chatStr),
+		)
+		_ = database.ChatThreadDropPairByTg(bc.cfg.Telegram.TargetChatID, bc.threadId)
+		newThreadId, resErr := resolveThreadId(v.Info, bc.cfg, bc.tgBot)
+		if resErr == nil {
+			bc.threadId = newThreadId
+			sentMsg, err = bc.tgBot.SendMessage(bc.cfg.Telegram.TargetChatID, bc.bridgedText,
+				&gotgbot.SendMessageOpts{
+					ReplyParameters:    utils.TgMakeReplyParameters(bc.replyToMsgId, 0),
+					MessageThreadId:    bc.threadId,
+					LinkPreviewOptions: &gotgbot.LinkPreviewOptions{},
+				})
+		}
+	}
+
 	if err != nil {
 		bc.logger.Error("failed to send telegram message",
 			zap.String("event_id", v.Info.ID),

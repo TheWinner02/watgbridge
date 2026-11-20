@@ -63,7 +63,7 @@ func NewTelegramClient() error {
 	err = updater.StartPolling(bot, &ext.PollingOpts{
 		DropPendingUpdates: true,
 		GetUpdatesOpts: &gotgbot.GetUpdatesOpts{
-			Timeout: 9,
+			Timeout: 10,
 			AllowedUpdates: []string{
 				"message",
 				"edited_message",
@@ -76,7 +76,7 @@ func NewTelegramClient() error {
 				"poll_answer",
 			},
 			RequestOpts: &gotgbot.RequestOpts{
-				Timeout: 10 * time.Second,
+				Timeout: 30 * time.Second,
 			},
 		},
 	})

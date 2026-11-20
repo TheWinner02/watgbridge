@@ -61,7 +61,16 @@ func Connect() (*gorm.DB, error) {
 			return nil, fmt.Errorf("Error: database config for type '%s' requires the keys %+v", dbType, missingKeys)
 		}
 
-		return gorm.Open(sqlite.Open(dbConfig["path"]), &gormConfig)
+		db, err := gorm.Open(sqlite.Open(dbConfig["path"]), &gormConfig)
+		if err != nil {
+			return nil, err
+		}
+		if sqlDB, err := db.DB(); err == nil {
+			sqlDB.Exec("PRAGMA journal_mode = WAL;")
+			sqlDB.Exec("PRAGMA synchronous = NORMAL;")
+			sqlDB.Exec("PRAGMA busy_timeout = 5000;")
+		}
+		return db, nil
 
 	case "mysql":
 
